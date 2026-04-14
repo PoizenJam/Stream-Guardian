@@ -49,6 +49,12 @@ class IngestPoller(QThread):
         port    = self.cfg.get("srs", "port")
 
         if backend == "mediamtx":
+            stream_name = self.cfg.get("srs", "stream_name")
+            if stream_name:
+                # Direct path lookup — returns full per-path stats including bytesReceived
+                return f"{scheme}://{host}:{port}/v3/paths/get/{stream_name}"
+            # No specific stream — fall back to list (won't include bytesReceived,
+            # but at least lets the user see paths exist)
             return f"{scheme}://{host}:{port}/v3/paths/list"
         elif backend == "generic":
             path = self.cfg.get("srs", "api_path")
@@ -149,37 +155,42 @@ class IngestPoller(QThread):
     # ------------------------------------------------------------------
 
     def _poll_mediamtx(self, data: dict) -> tuple[bool, str, float]:
-        """Parse MediaMTX /v3/paths/list response."""
+        """Parse MediaMTX response.
+
+        /v3/paths/get/<name> returns a single path object directly.
+        /v3/paths/list returns {items: [...]} but does NOT include bytesReceived
+        (only the per-path GET endpoint does).
+        """
         target_name = self.cfg.get("srs", "stream_name")
-        items = data.get("items", [])
 
-        path = None
-        for item in items:
-            name = item.get("name", "")
-            if target_name and name != target_name:
-                continue
-            # A path is "live" if it has at least one reader or one publisher
-            if item.get("ready", False):
-                path = item
-                break
-
-        if not path:
-            # If no specific name, take first ready path
-            if not target_name:
+        # Detect which response shape we got
+        if "items" in data:
+            # /v3/paths/list response — find the matching ready path
+            items = data.get("items", [])
+            path = None
+            for item in items:
+                name = item.get("name", "")
+                if target_name and name != target_name:
+                    continue
+                if item.get("ready", False):
+                    path = item
+                    break
+            if not path and not target_name:
                 for item in items:
                     if item.get("ready", False):
                         path = item
                         break
+        else:
+            # /v3/paths/get/<name> response — single object
+            path = data if data.get("ready", False) else None
 
         if not path:
             self._byte_samples.clear()
             return False, "", 0.0
 
-        # MediaMTX exposes bytesReceived on the source
-        bytes_received = 0
-        source = path.get("source", {})
-        if isinstance(source, dict):
-            bytes_received = int(source.get("bytesReceived", 0))
+        # MediaMTX exposes bytesReceived at the top level of the path object
+        # (NOT inside path.source — that only contains type and id)
+        bytes_received = int(path.get("bytesReceived", 0))
 
         # Use wall-clock ms for delta computation
         now_ms = int(time.time() * 1000)
