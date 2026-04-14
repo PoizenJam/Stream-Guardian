@@ -295,8 +295,19 @@ class IngestPoller(QThread):
                 consecutive_failures += 1
                 self.connection_status.emit(False, "Request timeout")
             except requests.HTTPError as e:
-                consecutive_failures += 1
-                self.connection_status.emit(False, f"HTTP {e.response.status_code}")
+                # MediaMTX returns 404 from /v3/paths/get/<n> when the path
+                # doesn't exist (i.e. publisher disconnected and on-demand path
+                # was destroyed). Treat as "no stream" rather than an API error
+                # so the disconnect threshold can fire.
+                if backend == "mediamtx" and e.response.status_code == 404:
+                    self.connection_status.emit(True, "Connected")
+                    consecutive_failures = 0
+                    self.stream_online.emit(False, "")
+                    self.bitrate_update.emit(0.0, 0.0, 0.0)
+                    self._byte_samples.clear()
+                else:
+                    consecutive_failures += 1
+                    self.connection_status.emit(False, f"HTTP {e.response.status_code}")
             except Exception as e:
                 consecutive_failures += 1
                 self.error.emit(str(e))
