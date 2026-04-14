@@ -1,0 +1,98 @@
+# Build StreamGuardian Windows EXE on release tag push
+# Creates a GitHub Release with:
+# - StreamGuardian-<version>-Windows.zip (PyInstaller EXE)
+# - StreamGuardian-<version>-Source.zip (Python source distribution)
+
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0
+
+permissions:
+  contents: write  # Needed to create releases
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: pyinstaller build.spec
+
+      - name: Copy supporting files into dist
+        run: |
+          Copy-Item -Path "README.md" -Destination "dist/"
+
+      - name: Create EXE zip
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          Compress-Archive -Path "dist/*" -DestinationPath "StreamGuardian-${version}-Windows.zip"
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: StreamGuardian-*-Windows.zip
+
+  build-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source zip
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          zip -r "StreamGuardian-${VERSION}-Source.zip" \
+            main.py \
+            config_manager.py \
+            ingest_client.py \
+            obs_client.py \
+            bitrate_engine.py \
+            gui/ \
+            requirements.txt \
+            build.spec \
+            build.bat \
+            build.sh \
+            icon.ico \
+            icon.png \
+            README.md
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-zip
+          path: StreamGuardian-*-Source.zip
+
+  create-release:
+    needs: [build-windows-exe, build-source]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            StreamGuardian-*-Windows.zip
+            StreamGuardian-*-Source.zip
