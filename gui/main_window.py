@@ -434,8 +434,13 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
         else:
+            # Accepting the event closes the window but does NOT stop the
+            # Qt event loop on its own — background QThreads (ingest, OBS)
+            # keep the process alive. Explicitly quit the application so
+            # the process actually exits.
             self._shutdown()
             event.accept()
+            QApplication.quit()
 
     # --- Session ---
 

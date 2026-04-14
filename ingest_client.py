@@ -319,4 +319,9 @@ class IngestPoller(QThread):
 
     def stop(self):
         self._running = False
+        # Wait for the run loop to exit so the process can terminate
+        # cleanly. Poll interval is typically 1s, so 3s is comfortably
+        # longer than one loop iteration.
+        if self.isRunning():
+            self.wait(3000)
         self.wait(3000)
