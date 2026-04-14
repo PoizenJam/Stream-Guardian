@@ -70,6 +70,15 @@ class BitrateEngine(QObject):
         self._min_bitrate = float("inf")
         self._drop_count = 0
 
+        # Recent stats for stability check (populated each evaluate)
+        self._last_std = 0.0
+
+        # Authoritative stream-online state from the ingest server. Set by
+        # main_window when ingest_client emits stream_online(...). Defaults
+        # to True so we don't trigger a false disconnect before the first
+        # poll arrives.
+        self._stream_online = True
+
         # Logging
         self._log_file = None
         self._csv_writer = None
@@ -202,6 +211,7 @@ class BitrateEngine(QObject):
         else:
             avg = 0.0
             std = 0.0
+        self._last_std = std
 
         # Session stats
         self._total_samples += 1
@@ -235,17 +245,60 @@ class BitrateEngine(QObject):
         # Log
         self._write_log(now, total_kbps, avg, self._state.name)
 
+    def set_stream_online(self, online: bool):
+        """Called by main_window from ingest_client.stream_online signal.
+        Authoritative ingest-side indication of whether a publisher is
+        currently connected. Used by the false-positive-aware disconnect
+        logic — the same signal is emitted by all backends (Oryx, MediaMTX,
+        generic) so this works uniformly across them."""
+        self._stream_online = bool(online)
+
     def _evaluate_thresholds(self, avg_kbps: float, now: float):
         low_thresh = self.cfg.get("thresholds", "low_bitrate_kbps")
         disc_thresh = self.cfg.get("thresholds", "disconnect_kbps")
         grace_s = self.cfg.get("thresholds", "grace_period_s")
         recovery_s = self.cfg.get("thresholds", "recovery_delay_s")
 
-        # Determine target state from average bitrate
-        if avg_kbps < disc_thresh:
+        # --- False-positive mitigation knobs ---
+        trust_offline = self.cfg.get("thresholds", "trust_ingest_offline_for_disconnect")
+        adaptive_floor = self.cfg.get("thresholds", "adaptive_floor_kbps")
+        cv_thresh = self.cfg.get("thresholds", "stability_cv_threshold")
+
+        # Determine target state.
+        #
+        # DISCONNECTED:
+        #   - If trust_ingest_offline is on (default), only when the ingest
+        #     server reports the stream is gone. This is the authoritative
+        #     signal and avoids the common false positive where an adaptive
+        #     encoder (Moblin SRT, x264 capped CRF, etc.) legitimately
+        #     drops bitrate on a static/dark scene.
+        #   - Otherwise, fall back to the legacy behaviour of triggering on
+        #     bitrate < disconnect threshold.
+        #
+        # LOW_BITRATE:
+        #   - Triggered when avg < low_thresh, BUT suppressed if the stream
+        #     looks like a stable adaptive coast: avg >= adaptive_floor AND
+        #     coefficient of variation (std/avg) < cv_thresh. A real network
+        #     problem produces erratic bitrate (high CV); a static scene at
+        #     low encoder cost produces a smooth low plateau (low CV).
+        if trust_offline:
+            disconnected = not self._stream_online
+        else:
+            disconnected = avg_kbps < disc_thresh
+
+        if disconnected:
             target = StreamState.DISCONNECTED
         elif avg_kbps < low_thresh:
-            target = StreamState.LOW_BITRATE
+            # Adaptive-stable suppression
+            if (
+                adaptive_floor > 0
+                and avg_kbps >= adaptive_floor
+                and avg_kbps > 0
+                and (self._last_std / avg_kbps) < cv_thresh
+            ):
+                target = StreamState.NORMAL
+            else:
+                target = StreamState.LOW_BITRATE
         else:
             target = StreamState.NORMAL
 

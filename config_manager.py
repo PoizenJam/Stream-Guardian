@@ -40,6 +40,25 @@ DEFAULT_CONFIG = {
         "grace_period_s": 3,
         "recovery_delay_s": 5,
         "cooldown_s": 10,
+        # --- False-positive mitigation (adaptive bitrate / static-scene aware) ---
+        # When True, the DISCONNECTED state is only triggered when the ingest
+        # server reports the stream is actually offline (no path / no data
+        # arriving), instead of relying on the bitrate threshold alone.
+        # This eliminates the most common false positive: an adaptive encoder
+        # (e.g. Moblin SRT) legitimately dropping bitrate on a static/dark
+        # scene. Works with Oryx, MediaMTX, and generic backends — all of them
+        # emit stream_online(False, "") when the publisher is gone.
+        "trust_ingest_offline_for_disconnect": True,
+        # If average bitrate is at or above this floor AND the stream is
+        # "stable" (low coefficient of variation, see below), suppress the
+        # LOW_BITRATE trigger. Set to 0 to disable. A typical value is the
+        # encoder's expected static-scene minimum (e.g. 500–800 kbps for a
+        # 3000 kbps target).
+        "adaptive_floor_kbps": 0,
+        # Coefficient of variation (std/avg) below which the stream is
+        # considered "stable adaptive" rather than "network-troubled".
+        # 0.25 means std must be under 25% of the mean. Lower = stricter.
+        "stability_cv_threshold": 0.25,
     },
     "scenes": {
         "low_bitrate_scene": "Low Bitrate",

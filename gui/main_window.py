@@ -255,10 +255,14 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("SRS connected | Monitoring bitrate")
 
     def _on_stream_status(self, online: bool, stream_id: str):
+        # The "Stream" label is already provided by the StatusIndicator,
+        # so we only pass the stream id (or status text) as the message.
         if online:
-            self.tab_dashboard.stream_status.set_status(True, f"Stream: {stream_id}")
+            self.tab_dashboard.stream_status.set_status(True, stream_id or "online")
         else:
             self.tab_dashboard.stream_status.set_status(False, "No stream detected")
+        # Forward to engine for false-positive-aware disconnect handling
+        self.engine.set_stream_online(online)
 
     def _on_obs_status(self, connected: bool, message: str):
         self.tab_dashboard.obs_status.set_status(connected, message)
@@ -339,6 +343,9 @@ class MainWindow(QMainWindow):
         self.tab_log.append("Settings updated")
         self._apply_theme()
 
+        # Refresh dashboard ingest label (SRS / MediaMTX / Ingest)
+        self.tab_dashboard.refresh_ingest_label()
+
         # Rebuild hotkey
         if self._hotkey_shortcut:
             self._hotkey_shortcut.setEnabled(False)
@@ -370,6 +377,7 @@ class MainWindow(QMainWindow):
     def _on_preset_loaded(self):
         self.tab_settings._load_from_config()
         self._apply_theme()
+        self.tab_dashboard.refresh_ingest_label()
         self.tab_log.append("Preset loaded — settings refreshed")
 
     # --- Theme ---

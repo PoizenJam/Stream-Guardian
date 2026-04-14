@@ -394,6 +394,74 @@ class SettingsTab(QWidget):
         thresh_group.setLayout(thresh_layout)
         main_layout.addWidget(thresh_group)
 
+        # === False Positive Mitigation ===
+        # Adaptive encoders (Moblin SRT, x264 capped CRF, etc.) legitimately
+        # drop their bitrate on dark or static scenes — that's not a network
+        # problem. These options help Stream Guardian tell the difference.
+        fp_group = QGroupBox("False Positive Mitigation (Adaptive Bitrate)")
+        fp_layout = QGridLayout()
+
+        self.fp_trust_offline = QCheckBox(
+            "Only trigger DISCONNECTED when the ingest server reports the stream is offline"
+        )
+        self.fp_trust_offline.setToolTip(
+            "RECOMMENDED. When enabled, the disconnect state is driven by\n"
+            "the ingest server's own stream-online signal (Oryx, MediaMTX,\n"
+            "and generic backends all report this) instead of the bitrate\n"
+            "threshold. This prevents an adaptive encoder briefly dipping\n"
+            "below the disconnect threshold on a static scene from being\n"
+            "treated as a real disconnect.\n\n"
+            "Disable to fall back to the legacy bitrate-only behaviour."
+        )
+
+        self.fp_floor = QSpinBox()
+        self.fp_floor.setRange(0, 100000)
+        self.fp_floor.setSuffix(" kbps")
+        self.fp_floor.setSingleStep(50)
+        self.fp_floor.setToolTip(
+            "Adaptive bitrate floor. If the average bitrate is at or above\n"
+            "this value AND the stream is stable (see Stability CV below),\n"
+            "the LOW BITRATE trigger is suppressed.\n\n"
+            "Set this to your encoder's expected static-scene minimum.\n"
+            "For a 3000 kbps target with adaptive bitrate, 500–800 kbps\n"
+            "is typical. Set to 0 to disable this check entirely."
+        )
+
+        self.fp_cv = QDoubleSpinBox()
+        self.fp_cv.setRange(0.0, 2.0)
+        self.fp_cv.setSingleStep(0.05)
+        self.fp_cv.setDecimals(2)
+        self.fp_cv.setToolTip(
+            "Stability threshold expressed as coefficient of variation\n"
+            "(standard deviation ÷ mean) over the averaging window.\n\n"
+            "A real network problem produces erratic bitrate (high CV).\n"
+            "An encoder coasting on a static scene produces a smooth low\n"
+            "plateau (low CV). Below this value, the stream is considered\n"
+            "stable and the adaptive-floor suppression applies.\n\n"
+            "0.25 is a sensible default. Lower = stricter (suppress only\n"
+            "very smooth streams). Higher = more lenient."
+        )
+
+        fp_layout.addWidget(self.fp_trust_offline, 0, 0, 1, 2)
+        fp_layout.addWidget(QLabel("Adaptive Bitrate Floor:"), 1, 0)
+        fp_layout.addWidget(self.fp_floor, 1, 1)
+        fp_layout.addWidget(QLabel("Stability CV Threshold:"), 2, 0)
+        fp_layout.addWidget(self.fp_cv, 2, 1)
+
+        fp_help = QLabel(
+            "Tip: With Moblin or any SRT/RIST adaptive source, leave\n"
+            "“trust ingest offline” enabled and set the floor a few hundred\n"
+            "kbps below your normal minimum. Keep the bitrate “Disconnect\n"
+            "Threshold” above as a fallback for backends that don't reliably\n"
+            "report offline status."
+        )
+        fp_help.setProperty("dim", True)
+        fp_help.setWordWrap(True)
+        fp_layout.addWidget(fp_help, 3, 0, 1, 2)
+
+        fp_group.setLayout(fp_layout)
+        main_layout.addWidget(fp_group)
+
         # === Protection Actions (Low Bitrate) ===
         low_group = QGroupBox("Low Bitrate Protection")
         low_layout = QVBoxLayout()
@@ -725,6 +793,9 @@ class SettingsTab(QWidget):
         self.thresh_grace.setValue(c.get("thresholds", "grace_period_s"))
         self.thresh_recovery.setValue(c.get("thresholds", "recovery_delay_s"))
         self.thresh_cooldown.setValue(c.get("thresholds", "cooldown_s"))
+        self.fp_trust_offline.setChecked(c.get("thresholds", "trust_ingest_offline_for_disconnect"))
+        self.fp_floor.setValue(c.get("thresholds", "adaptive_floor_kbps"))
+        self.fp_cv.setValue(c.get("thresholds", "stability_cv_threshold"))
 
         # Protection modes
         self._load_protection(self.protection_low, "low_bitrate")
@@ -807,6 +878,9 @@ class SettingsTab(QWidget):
         c.set("thresholds", "grace_period_s", self.thresh_grace.value())
         c.set("thresholds", "recovery_delay_s", self.thresh_recovery.value())
         c.set("thresholds", "cooldown_s", self.thresh_cooldown.value())
+        c.set("thresholds", "trust_ingest_offline_for_disconnect", self.fp_trust_offline.isChecked())
+        c.set("thresholds", "adaptive_floor_kbps", self.fp_floor.value())
+        c.set("thresholds", "stability_cv_threshold", self.fp_cv.value())
 
         # Protection modes
         self._apply_protection(self.protection_low, "low_bitrate")

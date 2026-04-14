@@ -36,6 +36,9 @@ class StatusIndicator(QWidget):
 
         self.set_status(False, "Disconnected")
 
+    def set_label(self, label: str):
+        self._label.setText(label)
+
     def set_status(self, connected: bool, message: str = ""):
         if connected:
             self._dot.setStyleSheet("color: #3ec45c; font-size: 14px; background: transparent;")
@@ -97,11 +100,22 @@ class StatCard(QFrame):
 
 
 class DashboardTab(QWidget):
+    INGEST_LABELS = {"oryx": "SRS", "mediamtx": "MediaMTX", "generic": "Ingest"}
+
     def __init__(self, config_manager, parent=None):
         super().__init__(parent)
         self.cfg = config_manager
         self._colors = COLORS_DARK if self.cfg.get("gui", "theme") == "dark" else COLORS_LIGHT
         self._build_ui()
+
+    def _ingest_label(self) -> str:
+        backend = self.cfg.get("srs", "backend")
+        return self.INGEST_LABELS.get(backend, "Ingest")
+
+    def refresh_ingest_label(self):
+        """Called after settings are applied so the connection-row label
+        reflects the currently selected backend (Oryx / MediaMTX / generic)."""
+        self.srs_status.set_label(self._ingest_label())
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -110,7 +124,7 @@ class DashboardTab(QWidget):
 
         # --- Connection status bar ---
         status_row = QHBoxLayout()
-        self.srs_status = StatusIndicator("SRS")
+        self.srs_status = StatusIndicator(self._ingest_label())
         self.obs_status = StatusIndicator("OBS")
         self.stream_status = StatusIndicator("Stream")
         status_row.addWidget(self.srs_status)
