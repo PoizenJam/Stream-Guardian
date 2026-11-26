@@ -95,7 +95,11 @@ class PresetsTab(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        self.cfg.save_preset(name)
+        # Errors are reported instead of raised: an exception escaping a Qt
+        # slot closes the whole app in PyQt6 (e.g. a "/" in the preset name).
+        if not self.cfg.save_preset(name):
+            QMessageBox.warning(self, "Save Preset", f"Preset not saved:\n{self.cfg.save_error}")
+            return
         self._refresh_list()
         self.preset_name_input.clear()
         QMessageBox.information(self, "Preset Saved", f"Preset '{name}' saved successfully.")
@@ -128,7 +132,10 @@ class PresetsTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.cfg.delete_preset(name)
+            try:
+                self.cfg.delete_preset(name)
+            except OSError as e:
+                QMessageBox.warning(self, "Delete Preset", f"Could not delete preset:\n{e}")
             self._refresh_list()
 
     def _import_preset(self):
@@ -137,7 +144,11 @@ class PresetsTab(QWidget):
         )
         if path:
             name = None  # Use filename
-            self.cfg.import_preset(path, name)
+            try:
+                self.cfg.import_preset(path, name)
+            except OSError as e:
+                QMessageBox.warning(self, "Import Preset", f"Could not import preset:\n{e}")
+                return
             self._refresh_list()
             QMessageBox.information(self, "Imported", "Preset imported successfully.")
 
@@ -151,5 +162,9 @@ class PresetsTab(QWidget):
             self, "Export Preset", f"{name}.json", "JSON Files (*.json)"
         )
         if path:
-            self.cfg.export_preset(name, path)
+            try:
+                self.cfg.export_preset(name, path)
+            except OSError as e:
+                QMessageBox.warning(self, "Export Preset", f"Could not export preset:\n{e}")
+                return
             QMessageBox.information(self, "Exported", f"Preset '{name}' exported.")

@@ -318,7 +318,8 @@ class TestCsvLog(EngineTestBase):
         self.eng.process_bitrate(3000, 3000, 0)
         self.eng.stop_logging()
         name = [n for n in os.listdir(self.tmp.name) if n.startswith("bitrate_")][0]
-        rows = list(csv.reader(open(os.path.join(self.tmp.name, name))))
+        with open(os.path.join(self.tmp.name, name), newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
         self.assertEqual(rows[0][:4], ["timestamp", "bitrate_kbps", "avg_kbps", "state"])
         self.assertEqual(rows[0][4:], ["event", "packet_loss_pct", "rtt_ms"])
         self.assertEqual(rows[1][4], "TEST NORMAL->LOW_BITRATE")
@@ -332,5 +333,6 @@ class TestCsvLog(EngineTestBase):
         self.eng.log_summary()
         self.eng.stop_logging()
         name = [n for n in os.listdir(self.tmp.name) if n.startswith("bitrate_")][0]
-        rows = list(csv.reader(open(os.path.join(self.tmp.name, name))))
+        with open(os.path.join(self.tmp.name, name), newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
         self.assertTrue(rows[-1][4].startswith("SESSION SUMMARY:"))

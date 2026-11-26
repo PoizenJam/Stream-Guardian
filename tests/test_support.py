@@ -21,6 +21,11 @@ from obs_client import OBSClient
 _app = QApplication.instance() or QApplication([])
 
 
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 class TestConfig(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -35,15 +40,41 @@ class TestConfig(unittest.TestCase):
         with cfg.batch():
             cfg.set("obs", "port", 2222)
             cfg.set("obs", "host", "studio")
-            self.assertEqual(json.load(open(cfg.config_path))["obs"]["port"], 1111)
-        self.assertEqual(json.load(open(cfg.config_path))["obs"]["port"], 2222)
-        self.assertEqual(json.load(open(cfg.backup_path))["obs"]["port"], 1111)
+            self.assertEqual(read_json(cfg.config_path)["obs"]["port"], 1111)
+        self.assertEqual(read_json(cfg.config_path)["obs"]["port"], 2222)
+        self.assertEqual(read_json(cfg.backup_path)["obs"]["port"], 1111)
+
+    def test_config_file_is_ascii(self):
+        # Default webhook messages contain emoji; the file must still read
+        # under any encoding (Windows cp1252 default, older versions).
+        cfg = ConfigManager(config_dir=self.dir)
+        cfg.save()
+        with open(cfg.config_path, "rb") as f:
+            f.read().decode("ascii")  # raises if any non-ASCII byte was written
+        with open(cfg.config_path, encoding="cp1252") as f:
+            self.assertIn(r"\u2705 Stream recovered", f.read())
+
+    def test_locked_config_does_not_raise(self):
+        # Windows: os.replace fails while another program holds the file
+        from unittest import mock
+        cfg = ConfigManager(config_dir=self.dir)
+        cfg.set("obs", "port", 1111)
+        with mock.patch("config_manager.os.replace", side_effect=PermissionError("in use")), \
+                mock.patch("config_manager.time.sleep"):
+            self.assertTrue(cfg.save())  # falls back to writing in place
+        self.assertEqual(read_json(cfg.config_path)["obs"]["port"], 1111)
+        self.assertFalse(os.path.exists(str(cfg.config_path) + ".tmp"))
+        with mock.patch("config_manager.os.replace", side_effect=PermissionError("in use")), \
+                mock.patch("config_manager.time.sleep"), \
+                mock.patch("builtins.open", side_effect=PermissionError("locked")):
+            self.assertFalse(cfg.save())
+        self.assertIn("could not save settings", cfg.save_error)
 
     def test_corrupt_config_recovers_from_backup(self):
         cfg = ConfigManager(config_dir=self.dir)
         cfg.set("obs", "port", 1111)
         cfg.set("obs", "port", 2222)  # backup now holds 1111
-        with open(cfg.config_path, "w") as f:
+        with open(cfg.config_path, "w", encoding="utf-8") as f:
             f.write('{"obs": {"port": 22')  # truncated write
         cfg2 = ConfigManager(config_dir=self.dir)
         self.assertEqual(cfg2.get("obs", "port"), 1111)
@@ -51,7 +82,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(any(n.startswith("config.corrupt-") for n in os.listdir(self.dir)))
 
     def test_old_override_enabled_flag_is_ignored(self):
-        with open(os.path.join(self.dir, "config.json"), "w") as f:
+        with open(os.path.join(self.dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump({"override": {"enabled": True, "hotkey": "Alt+F9"}}, f)
         cfg = ConfigManager(config_dir=self.dir)
         self.assertNotIn("enabled", cfg.get("override"))

@@ -75,5 +75,7 @@ class LogTab(QWidget):
             self, "Export Log", f"bitrate_log_{ts}.txt", "Text Files (*.txt)"
         )
         if path:
-            with open(path, "w") as f:
+            # UTF-8: log lines contain characters (e.g. arrows) the Windows
+            # default encoding can't write, which crashed the export.
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(self.log_text.toPlainText())

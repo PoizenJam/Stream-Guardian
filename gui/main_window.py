@@ -392,6 +392,7 @@ class MainWindow(QMainWindow):
 
     def _on_settings_changed(self):
         self.tab_log.append("Settings updated")
+        self._report_save_error()
         self._apply_theme()
 
         # Refresh dashboard ingest label (SRS / MediaMTX / Ingest)
@@ -422,6 +423,10 @@ class MainWindow(QMainWindow):
         on_top = self.cfg.get("gui", "always_on_top")
         self.act_on_top.setChecked(on_top)
         self._apply_on_top(on_top)
+
+    def _report_save_error(self):
+        if self.cfg.save_error:
+            self.tab_log.append(f"CONFIG ERROR: {self.cfg.save_error}")
 
     def _on_preset_loaded(self):
         # Run the full settings-changed path so logging, hotkey, always-on-top

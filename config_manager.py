@@ -149,6 +149,8 @@ class ConfigManager:
         self._dirty = False
         # Human-readable note for the log when load had to recover
         self.load_message = ""
+        # Last save failure (empty when the last save worked); shown in the Log tab
+        self.save_error = ""
         self.load()
 
     def load(self):
@@ -183,16 +185,26 @@ class ConfigManager:
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return None
 
-    def save(self):
+    def save(self) -> bool:
+        """Never raises: an exception escaping a Qt slot closes the app in
+        PyQt6. Failures are recorded in save_error instead."""
         if self._batch_depth:
             self._dirty = True
-            return
-        self._atomic_write(self.config_path, self.config, backup=True)
+            return True
+        try:
+            self._atomic_write(self.config_path, self.config, backup=True)
+            self.save_error = ""
+            return True
+        except OSError as e:
+            self.save_error = f"could not save settings to {self.config_path}: {e}"
+            return False
 
     def _atomic_write(self, path: Path, data: dict, backup: bool = False):
         tmp = path.with_name(path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            # ASCII-only (emoji escaped), as in v1.0/v1.1: readable whatever
+            # encoding opens it, including an older Stream Guardian.
+            json.dump(data, f, indent=2, ensure_ascii=True)
             f.flush()
             os.fsync(f.fileno())
         if backup and path.exists():
@@ -200,7 +212,23 @@ class ConfigManager:
                 shutil.copy2(path, self.backup_path)
             except OSError:
                 pass
-        os.replace(tmp, path)
+        # On Windows the replace fails while another program (OneDrive,
+        # antivirus, an editor) has the file open. Retry for about 2 s, then
+        # fall back to overwriting in place (not atomic, but saves the change).
+        for _ in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.1)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=True)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     @contextmanager
     def batch(self):
@@ -234,8 +262,13 @@ class ConfigManager:
         self.save()
 
     # --- Presets ---
-    def save_preset(self, name: str):
-        self._atomic_write(self.presets_dir / f"{name}.json", self.config)
+    def save_preset(self, name: str) -> bool:
+        try:
+            self._atomic_write(self.presets_dir / f"{name}.json", self.config)
+            return True
+        except OSError as e:
+            self.save_error = f"could not save preset '{name}': {e}"
+            return False
 
     def load_preset(self, name: str) -> bool:
         path = self.presets_dir / f"{name}.json"

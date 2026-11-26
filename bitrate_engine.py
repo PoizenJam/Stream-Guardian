@@ -743,7 +743,7 @@ class BitrateEngine(QObject):
 
         filename = f"bitrate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         filepath = os.path.join(log_dir, filename)
-        self._log_file = open(filepath, "w", newline="")
+        self._log_file = open(filepath, "w", newline="", encoding="utf-8")
         self._csv_writer = csv.writer(self._log_file)
         # New columns are appended after the original four so existing
         # spreadsheets/scripts that read by position keep working.
