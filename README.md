@@ -50,6 +50,7 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 - **Manual override hotkey** — configurable keyboard shortcut to toggle auto-switching
 - **Override toggle** — dashboard button + tray menu + hotkey all control the same state
 - **Always on top** mode
+- **Single instance** — launching a second copy shows a warning and brings the running window forward instead
 
 ### Configuration
 - **Persistent settings** saved between sessions (JSON)
@@ -149,6 +150,7 @@ bitrate-guardian/
 ├── srs_client.py           # Oryx SRS API poller (background thread)
 ├── obs_client.py           # OBS WebSocket client + source visibility control
 ├── bitrate_engine.py       # State machine, audio alerts, webhook dispatch
+├── single_instance.py      # Blocks a second copy; brings the running window forward
 ├── gui/
 │   ├── main_window.py      # Main window, menus, tray, hotkey binding
 │   ├── dashboard.py        # Real-time graph + stat cards + indicators

@@ -64,6 +64,7 @@ jobs:
             ingest_client.py \
             obs_client.py \
             bitrate_engine.py \
+            single_instance.py \
             gui/ \
             requirements.txt \
             build.spec \

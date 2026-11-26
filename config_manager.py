@@ -10,7 +10,7 @@ from pathlib import Path
 # === App identity — change these to rename/version the app ===
 APP_NAME = "Stream Guardian"           # Display name (window title, tray, webhooks)
 APP_INTERNAL_NAME = "StreamGuardian"   # Folder/exe name (no spaces, used for paths)
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 DEFAULT_CONFIG = {
     "srs": {
