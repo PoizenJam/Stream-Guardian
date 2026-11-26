@@ -153,7 +153,7 @@ class SettingsTab(QWidget):
         self.srs_backend.setToolTip(
             "Select your ingest server backend:\n\n"
             "  Oryx — Oryx/SRS media server (/api/v1/streams/)\n"
-            "  MediaMTX — MediaMTX relay server (/v3/paths/list)\n"
+            "  MediaMTX — MediaMTX relay server (/v3/paths/get/<name>)\n"
             "  Generic — Custom JSON endpoint with configurable key"
         )
         self.srs_backend.currentTextChanged.connect(self._on_backend_changed)
@@ -464,6 +464,53 @@ class SettingsTab(QWidget):
 
         fp_group.setLayout(fp_layout)
         main_layout.addWidget(fp_group)
+
+        # === SRT Link Quality (MediaMTX) ===
+        link_group = QGroupBox("SRT Link Quality (MediaMTX backend, SRT publishers)")
+        link_layout = QGridLayout()
+
+        self.link_enabled = QCheckBox("Read SRT link stats (packet loss, round-trip time)")
+        self.link_enabled.setToolTip(
+            "Reads the publisher's SRT connection stats from MediaMTX\n"
+            "(/v3/srtconns/get/<id>) on every poll and shows them on the\n"
+            "dashboard. Only applies when the stream arrives over SRT."
+        )
+        self.link_max_loss = QDoubleSpinBox()
+        self.link_max_loss.setRange(0.0, 100.0)
+        self.link_max_loss.setSingleStep(0.5)
+        self.link_max_loss.setDecimals(1)
+        self.link_max_loss.setSuffix(" %")
+        self.link_max_loss.setSpecialValueText("Off")
+        self.link_max_loss.setToolTip(
+            "Enter LOW BITRATE protection when packet loss over the averaging\n"
+            "window goes above this. Loss here counts packets SRT had to\n"
+            "re-request, so it rises before the picture actually breaks up.\n"
+            "0 = off. Watch the dashboard on a good day to pick a value."
+        )
+        self.link_max_rtt = QSpinBox()
+        self.link_max_rtt.setRange(0, 10000)
+        self.link_max_rtt.setSingleStep(50)
+        self.link_max_rtt.setSuffix(" ms")
+        self.link_max_rtt.setSpecialValueText("Off")
+        self.link_max_rtt.setToolTip(
+            "Enter LOW BITRATE protection when the smoothed round-trip time\n"
+            "goes above this. Keep it well under your SRT latency setting.\n"
+            "0 = off."
+        )
+        link_layout.addWidget(self.link_enabled, 0, 0, 1, 2)
+        link_layout.addWidget(QLabel("Max Packet Loss:"), 1, 0)
+        link_layout.addWidget(self.link_max_loss, 1, 1)
+        link_layout.addWidget(QLabel("Max Round-Trip Time:"), 2, 0)
+        link_layout.addWidget(self.link_max_rtt, 2, 1)
+        link_help = QLabel(
+            "Both limits use the same grace period, recovery delay and cooldown "
+            "as the bitrate thresholds."
+        )
+        link_help.setProperty("dim", True)
+        link_help.setWordWrap(True)
+        link_layout.addWidget(link_help, 3, 0, 1, 2)
+        link_group.setLayout(link_layout)
+        main_layout.addWidget(link_group)
 
         # === Protection Actions (Low Bitrate) ===
         low_group = QGroupBox("Low Bitrate Protection")
@@ -798,6 +845,9 @@ class SettingsTab(QWidget):
         self.fp_trust_offline.setChecked(c.get("thresholds", "trust_ingest_offline_for_disconnect"))
         self.fp_floor.setValue(c.get("thresholds", "adaptive_floor_kbps"))
         self.fp_cv.setValue(c.get("thresholds", "stability_cv_threshold"))
+        self.link_enabled.setChecked(c.get("srs", "link_stats_enabled"))
+        self.link_max_loss.setValue(c.get("thresholds", "max_packet_loss_pct"))
+        self.link_max_rtt.setValue(c.get("thresholds", "max_rtt_ms"))
 
         # Protection modes
         self._load_protection(self.protection_low, "low_bitrate")
@@ -890,6 +940,9 @@ class SettingsTab(QWidget):
         c.set("thresholds", "trust_ingest_offline_for_disconnect", self.fp_trust_offline.isChecked())
         c.set("thresholds", "adaptive_floor_kbps", self.fp_floor.value())
         c.set("thresholds", "stability_cv_threshold", self.fp_cv.value())
+        c.set("srs", "link_stats_enabled", self.link_enabled.isChecked())
+        c.set("thresholds", "max_packet_loss_pct", self.link_max_loss.value())
+        c.set("thresholds", "max_rtt_ms", self.link_max_rtt.value())
 
         # Protection modes
         self._apply_protection(self.protection_low, "low_bitrate")

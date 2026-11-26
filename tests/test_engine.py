@@ -43,9 +43,13 @@ class FakeOBS:
 
 
 class QuietEngine(BitrateEngine):
-    def _init_audio(self):  # no audio device needed for tests
-        self._audio_player = None
-        self._audio_output = None
+    """Records webhooks instead of sending them."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.webhooks = []
+
+    def _send_webhook(self, message):
+        self.webhooks.append(message)
 
 
 class EngineTestBase(unittest.TestCase):
@@ -211,3 +215,122 @@ class TestOverride(EngineTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRehearsal(EngineTestBase):
+    def test_test_low_switches_immediately_and_restores(self):
+        self.cfg.set("notifications", "webhook_enabled", True)
+        self.cfg.set("notifications", "webhook_url", "https://example.invalid/hook")
+        self.eng._last_switch_time = 10**12  # pretend a cooldown is running
+        self.eng.simulate("low")
+        self.assertEqual(self.eng.state, StreamState.LOW_BITRATE)
+        self.assertEqual(self.obs.current_scene, "Low Bitrate")
+        self.assertEqual(self.eng._drop_count, 0)
+        self.assertEqual(self.eng.webhooks, [])  # rehearsals never alert Discord
+        self.feed(3000, 20)  # real evaluation paused during the test
+        self.assertEqual(self.eng.state, StreamState.LOW_BITRATE)
+        self.eng.simulate("")
+        self.assertEqual(self.eng.state, StreamState.NORMAL)
+        self.assertEqual(self.obs.current_scene, "Main")
+        self.assertIsNone(self.eng.test_state)
+
+    def test_test_mode_times_out(self):
+        self.eng.simulate("disconnect")
+        self.eng._test_until = 0  # force expiry on the next sample
+        self.eng.process_bitrate(3000, 3000, 0)
+        self.assertIsNone(self.eng.test_state)
+        self.assertEqual(self.eng.state, StreamState.NORMAL)
+        self.assertTrue(any("timed out" in m for m in self.log))
+
+    def test_test_does_not_start_cooldown(self):
+        self.eng.simulate("low")
+        self.eng.simulate("")
+        self.feed(500, 4)  # a real drop right after the test is handled normally
+        self.assertEqual(self.eng.state, StreamState.LOW_BITRATE)
+        self.assertEqual(self.eng._drop_count, 1)
+
+
+class TestLinkTriggers(EngineTestBase):
+    def link(self, received, lost, rtt=30.0, seconds=1):
+        for _ in range(seconds):
+            self.eng.set_link_stats({"available": True, "received": received,
+                                     "lost": lost, "dropped": 0, "rtt_ms": rtt})
+
+    def test_packet_loss_triggers_low_even_at_good_bitrate(self):
+        self.cfg.set("thresholds", "max_packet_loss_pct", 2.0)
+        self.link(950, 50)  # 5 % loss
+        self.eng._link_summary = self.eng._summarize_link()
+        self.assertAlmostEqual(self.eng._link_summary["loss_pct"], 5.0)
+        self.feed(3000, 4)
+        self.assertEqual(self.eng.state, StreamState.LOW_BITRATE)
+        self.assertTrue(any("packet loss 5.0%" in m for m in self.log))
+
+    def test_rtt_limit_and_off_by_default(self):
+        self.link(1000, 0, rtt=900)
+        self.eng._link_summary = self.eng._summarize_link()
+        self.feed(3000, 5)
+        self.assertEqual(self.eng.state, StreamState.NORMAL)  # limits default to off
+        self.cfg.set("thresholds", "max_rtt_ms", 500)
+        self.feed(3000, 4)
+        self.assertEqual(self.eng.state, StreamState.LOW_BITRATE)
+
+    def test_unavailable_link_clears(self):
+        self.link(1000, 100)
+        self.eng.set_link_stats({"available": False})
+        self.assertEqual(self.eng._summarize_link(), {"available": False})
+
+
+class TestSessionSummary(EngineTestBase):
+    def test_time_in_state_and_longest_outage(self):
+        eng = self.eng
+        t0 = 5000.0
+        eng._session_start = eng._accum_from = t0
+        eng._transition_to(StreamState.LOW_BITRATE, t0 + 100, 500)
+        eng._transition_to(StreamState.DISCONNECTED, t0 + 130, 0)
+        eng._transition_to(StreamState.NORMAL, t0 + 190, 3000)
+        eng.simulate("low")                      # tests are excluded
+        eng._accum_from = t0 + 200
+        eng._transition_to(StreamState.NORMAL, t0 + 260, 3000, test=True)
+        eng._test_state = None
+        summary = eng.session_summary(now=t0 + 3600)
+        self.assertIn("1h00m monitored", summary)
+        self.assertIn("1 drop,", summary)
+        self.assertIn("low bitrate 30s", summary)
+        self.assertIn("disconnected 1m00s", summary)
+        self.assertIn("longest outage 1m30s", summary)
+
+    def test_stats_payload_has_graph_and_link(self):
+        got = []
+        self.eng.stats_updated.connect(got.append)
+        self.eng.process_bitrate(2500, 2500, 0)
+        self.assertEqual(got[-1]["graph"][-1][1], 2500)
+        self.assertEqual(got[-1]["link"], {"available": False})
+        self.assertEqual(got[-1]["test"], "")
+
+
+class TestCsvLog(EngineTestBase):
+    def test_event_column_records_transitions(self):
+        import csv
+        self.cfg.set("logging", "directory", self.tmp.name)
+        self.eng.start_logging()
+        self.eng.simulate("low")
+        self.eng.process_bitrate(3000, 3000, 0)
+        self.eng.process_bitrate(3000, 3000, 0)
+        self.eng.stop_logging()
+        name = [n for n in os.listdir(self.tmp.name) if n.startswith("bitrate_")][0]
+        rows = list(csv.reader(open(os.path.join(self.tmp.name, name))))
+        self.assertEqual(rows[0][:4], ["timestamp", "bitrate_kbps", "avg_kbps", "state"])
+        self.assertEqual(rows[0][4:], ["event", "packet_loss_pct", "rtt_ms"])
+        self.assertEqual(rows[1][4], "TEST NORMAL->LOW_BITRATE")
+        self.assertEqual(rows[2][4], "")
+
+    def test_summary_written_to_csv(self):
+        import csv
+        self.cfg.set("logging", "directory", self.tmp.name)
+        self.eng.start_logging()
+        self.eng.process_bitrate(3000, 3000, 0)
+        self.eng.log_summary()
+        self.eng.stop_logging()
+        name = [n for n in os.listdir(self.tmp.name) if n.startswith("bitrate_")][0]
+        rows = list(csv.reader(open(os.path.join(self.tmp.name, name))))
+        self.assertTrue(rows[-1][4].startswith("SESSION SUMMARY:"))

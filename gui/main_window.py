@@ -8,8 +8,9 @@ from PyQt6.QtWidgets import (
     QMainWindow, QTabWidget, QApplication, QSystemTrayIcon,
     QMenu, QMenuBar, QStatusBar, QMessageBox,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from config_manager import ConfigManager, APP_NAME, APP_INTERNAL_NAME, APP_VERSION
 from ingest_client import IngestPoller
@@ -64,9 +65,17 @@ def make_icon():
 
 
 class MainWindow(QMainWindow):
+    # Requests to the engine, which lives on its own thread. Emitting these
+    # queues the call into the engine thread instead of calling across threads.
+    sig_override = pyqtSignal(bool)
+    sig_reset = pyqtSignal()
+    sig_logging = pyqtSignal(bool)
+    sig_simulate = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        self._test_active = False
         self.setMinimumSize(720, 480)
         self.resize(1100, 720)
 
@@ -75,6 +84,14 @@ class MainWindow(QMainWindow):
         self.srs = IngestPoller(self.cfg)
         self.obs = OBSClient(self.cfg)
         self.engine = BitrateEngine(self.cfg, self.obs)
+
+        # Engine on its own thread so OBS requests can't freeze the window
+        self.engine_thread = QThread(self)
+        self.engine_thread.setObjectName("StreamGuardianEngine")
+        self.engine.moveToThread(self.engine_thread)
+
+        # Alert sounds are played here: QMediaPlayer belongs on the GUI thread
+        self._init_audio()
 
         # Icon
         self._icon = make_icon()
@@ -101,13 +118,31 @@ class MainWindow(QMainWindow):
             self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
             self.show()
 
-        # Start services
+        # Start services (engine thread first so no sample arrives before it runs)
+        self.engine_thread.start()
+        if self.cfg.get("logging", "enabled"):
+            self.sig_logging.emit(True)
         self.srs.start()
         self.obs.start()
 
-        # Start logging if enabled
-        if self.cfg.get("logging", "enabled"):
-            self.engine.start_logging()
+    def _init_audio(self):
+        try:
+            self._audio_player = QMediaPlayer(self)
+            self._audio_output = QAudioOutput(self)
+            self._audio_player.setAudioOutput(self._audio_output)
+        except Exception:
+            self._audio_player = None
+            self._audio_output = None
+
+    def _play_audio(self, file_path: str, volume: int):
+        if not self._audio_player:
+            return
+        try:
+            self._audio_output.setVolume(max(0, min(volume, 100)) / 100.0)
+            self._audio_player.setSource(QUrl.fromLocalFile(file_path))
+            self._audio_player.play()
+        except Exception as e:
+            self.tab_log.append(f"Audio playback error: {e}")
 
     def _build_menus(self):
         menubar = self.menuBar()
@@ -207,8 +242,11 @@ class MainWindow(QMainWindow):
             self.tab_log.append(f"Failed to register hotkey: {e}")
 
     def _connect_signals(self):
-        # SRS signals
-        self.srs.bitrate_update.connect(self._on_bitrate)
+        # Ingest signals: data goes straight to the engine thread (queued);
+        # the window only gets what it displays.
+        self.srs.bitrate_update.connect(self.engine.process_bitrate)
+        self.srs.stream_online.connect(self.engine.set_stream_online)
+        self.srs.link_stats.connect(self.engine.set_link_stats)
         self.srs.connection_status.connect(self._on_srs_status)
         self.srs.stream_online.connect(self._on_stream_status)
         self.srs.error.connect(lambda msg: self.tab_log.append(f"SRS ERROR: {msg}"))
@@ -226,6 +264,19 @@ class MainWindow(QMainWindow):
         self.engine.scene_switch_triggered.connect(self._on_scene_switch)
         self.engine.source_toggle_triggered.connect(self._on_source_toggle)
         self.engine.log_entry.connect(self.tab_log.append)
+        self.engine.play_audio.connect(self._play_audio)
+        self.engine.test_mode_changed.connect(self._on_test_mode)
+
+        # GUI -> engine requests
+        self.sig_override.connect(self.engine.set_override)
+        self.sig_reset.connect(self.engine.reset_session)
+        self.sig_logging.connect(self.engine.set_logging)
+        self.sig_simulate.connect(self.engine.simulate)
+
+        # Rehearsal buttons
+        self.tab_dashboard.btn_test_low.clicked.connect(lambda: self.sig_simulate.emit("low"))
+        self.tab_dashboard.btn_test_disc.clicked.connect(lambda: self.sig_simulate.emit("disconnect"))
+        self.tab_dashboard.btn_test_end.clicked.connect(lambda: self.sig_simulate.emit(""))
 
         # Settings
         self.tab_settings.settings_changed.connect(self._on_settings_changed)
@@ -238,13 +289,10 @@ class MainWindow(QMainWindow):
         # Log toggle from dashboard
         self.tab_dashboard.btn_log_toggle.toggled.connect(self._on_log_toggle)
 
-    def _on_bitrate(self, total: float, video: float, audio: float):
-        self.engine.process_bitrate(total, video, audio)
-
     def _on_stats(self, stats: dict):
         self.tab_dashboard.update_stats(stats)
         self.tab_dashboard.update_graph(
-            self.engine.graph_data,
+            stats.get("graph", []),
             stats.get("average_kbps", 0),
         )
 
@@ -260,8 +308,6 @@ class MainWindow(QMainWindow):
             self.tab_dashboard.stream_status.set_status(True, stream_id or "online")
         else:
             self.tab_dashboard.stream_status.set_status(False, "No stream detected")
-        # Forward to engine for false-positive-aware disconnect handling
-        self.engine.set_stream_online(online)
 
     def _on_obs_status(self, connected: bool, message: str):
         self.tab_dashboard.obs_status.set_status(connected, message)
@@ -287,9 +333,10 @@ class MainWindow(QMainWindow):
     def _on_state_changed(self, new_state: str, old_state: str):
         self.tab_log.append(f"State: {old_state} → {new_state}")
         if self._tray:
+            suffix = " (test)" if self._test_active else ""
             self._tray.showMessage(
                 APP_NAME,
-                f"Stream state: {new_state.replace('_', ' ').title()}",
+                f"Stream state: {new_state.replace('_', ' ').title()}{suffix}",
                 QSystemTrayIcon.MessageIcon.Information,
                 3000,
             )
@@ -303,17 +350,17 @@ class MainWindow(QMainWindow):
 
     def _on_log_toggle(self, enabled: bool):
         """Start or stop CSV bitrate logging from dashboard toggle."""
-        if enabled:
-            self.engine.stop_logging()
-            self.engine.start_logging()
-        else:
-            self.engine.stop_logging()
+        self.sig_logging.emit(enabled)
+
+    def _on_test_mode(self, state_name: str):
+        self._test_active = bool(state_name)
+        self.tab_dashboard.set_test_mode(state_name)
 
     # --- Override ---
 
     def _on_override_toggle(self, enabled: bool):
         # Engine-held, not saved to config: a restart always resumes protection
-        self.engine.set_override(enabled)
+        self.sig_override.emit(enabled)
         if self._tray:
             self._tray_override_action.setText(
                 "Turn Auto-Switch ON" if enabled else "Turn Auto-Switch OFF"
@@ -363,10 +410,8 @@ class MainWindow(QMainWindow):
         self.tab_dashboard._update_log_btn(log_enabled)
         self.tab_dashboard.btn_log_toggle.blockSignals(False)
 
-        # Restart logging if needed
-        self.engine.stop_logging()
-        if log_enabled:
-            self.engine.start_logging()
+        # Restart logging (new file) or stop it, on the engine thread
+        self.sig_logging.emit(log_enabled)
 
         # Sync graph window spinner
         self.tab_dashboard.spin_graph_window.blockSignals(True)
@@ -455,7 +500,8 @@ class MainWindow(QMainWindow):
     # --- Session ---
 
     def _reset_session(self):
-        self.engine.reset_session()
+        # The engine logs a session summary before clearing
+        self.sig_reset.emit()
         self.tab_log.append("Session stats reset")
 
     # --- Quit ---
@@ -465,6 +511,10 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def _shutdown(self):
+        # Reached twice on Exit (from _quit, then closeEvent as the app quits)
+        if getattr(self, "_shut_down", False):
+            return
+        self._shut_down = True
         self.tab_log.append("Shutting down...")
         # Auto-save current UI settings so nothing is lost on close
         try:
@@ -472,8 +522,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._hotkey.unregister()
-        self.engine.stop_logging()
+        # Stop the data source, then the engine thread (lets any in-flight OBS
+        # request finish), then it is safe to touch the engine directly.
         self.srs.stop()
+        self.engine_thread.quit()
+        self.engine_thread.wait(6000)
+        self.engine.log_entry.disconnect()  # engine thread is stopped; log directly below
+        self.tab_log.append(self.engine.log_summary())
+        self.engine.stop_logging()
         self.obs.stop()
         if self._tray:
             self._tray.hide()

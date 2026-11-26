@@ -13,7 +13,12 @@ Bitrate modes (Oryx only):
   - SRS averaged: Reads recv_30s from the SRS API, which is a 30-second
     rolling average computed server-side. Only changes ~every 30s.
 
-MediaMTX always uses raw (bytesReceived delta) mode.
+MediaMTX always uses raw (byte-count delta) mode. When the publisher is
+connected over SRT, the poller also reads its SRT connection stats
+(/v3/srtconns/get/<id>: packetsReceived, packetsReceivedLoss,
+packetsReceivedDrop, msRTT) and emits per-poll deltas on link_stats. The
+legacy /v3/srtconns/ path is used because MediaMTX still serves it after the
+September 2026 rename to /v3/srt/conns/, so it works on old and new servers.
 """
 import time
 from collections import deque
@@ -26,6 +31,9 @@ class IngestPoller(QThread):
 
     bitrate_update = pyqtSignal(float, float, float)   # total_kbps, video_kbps, audio_kbps
     stream_online  = pyqtSignal(bool, str)              # is_online, stream_id
+    # SRT link stats (MediaMTX only): {"available": False} or per-poll deltas
+    # {"available": True, "received": n, "lost": n, "dropped": n, "rtt_ms": x}
+    link_stats     = pyqtSignal(dict)
     connection_status = pyqtSignal(bool, str)            # connected, message
     error = pyqtSignal(str)
 
@@ -37,6 +45,10 @@ class IngestPoller(QThread):
 
         # Raw bitrate computation: store (timestamp_ms, byte_count) samples
         self._byte_samples: deque = deque(maxlen=30)
+
+        # SRT link stats: previous counters (conn_id, received, lost, dropped)
+        self._srt_prev = None
+        self._link_was_available = None
 
     # ------------------------------------------------------------------
     # URL / header helpers
@@ -156,43 +168,57 @@ class IngestPoller(QThread):
     # MediaMTX helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _mtx_publisher_online(path: dict) -> bool:
+        """Newer MediaMTX: "online" = a publisher is connected, while the
+        deprecated "ready" means "available to readers", which stays true
+        with alwaysAvailable fallback content even after the publisher drops.
+        Older servers only have "ready"."""
+        if "online" in path:
+            return bool(path["online"])
+        return bool(path.get("ready", False))
+
     def _poll_mediamtx(self, data: dict) -> tuple[bool, str, float | None]:
         """Parse MediaMTX response.
 
         /v3/paths/get/<name> returns a single path object directly.
-        /v3/paths/list returns {items: [...]} but does NOT include bytesReceived
-        (only the per-path GET endpoint does).
+        /v3/paths/list returns {items: [...]} but does NOT include byte
+        counters (only the per-path GET endpoint does).
         """
         target_name = self.cfg.get("srs", "stream_name")
+        online = self._mtx_publisher_online
 
         # Detect which response shape we got
         if "items" in data:
-            # /v3/paths/list response — find the matching ready path
+            # /v3/paths/list response — find the matching online path
             items = data.get("items", [])
             path = None
             for item in items:
                 name = item.get("name", "")
                 if target_name and name != target_name:
                     continue
-                if item.get("ready", False):
+                if online(item):
                     path = item
                     break
             if not path and not target_name:
                 for item in items:
-                    if item.get("ready", False):
+                    if online(item):
                         path = item
                         break
         else:
             # /v3/paths/get/<name> response — single object
-            path = data if data.get("ready", False) else None
+            path = data if online(data) else None
 
         if not path:
             self._byte_samples.clear()
+            self._emit_link_unavailable()
             return False, "", 0.0
 
-        # MediaMTX exposes bytesReceived at the top level of the path object
-        # (NOT inside path.source — that only contains type and id)
-        bytes_received = int(path.get("bytesReceived", 0))
+        self._poll_srt_link(path)
+
+        # Byte counter at the top level of the path object (not in path.source).
+        # "inboundBytes" replaced the deprecated "bytesReceived" in 2026.
+        bytes_received = int(path.get("inboundBytes", path.get("bytesReceived", 0)))
 
         # Use wall-clock ms for delta computation
         now_ms = int(time.time() * 1000)
@@ -215,6 +241,57 @@ class IngestPoller(QThread):
 
         sid = path.get("name", "unknown")
         return True, sid, total
+
+    def _emit_link_unavailable(self):
+        self._srt_prev = None
+        if self._link_was_available is not False:
+            self._link_was_available = False
+            self.link_stats.emit({"available": False})
+
+    def _poll_srt_link(self, path: dict):
+        """Read SRT stats for the path's publisher, if it is an SRT connection."""
+        source = path.get("source") or {}
+        if not self.cfg.get("srs", "link_stats_enabled") or source.get("type") != "srtConn" \
+                or not source.get("id"):
+            self._emit_link_unavailable()
+            return
+        scheme = "https" if self.cfg.get("srs", "use_ssl") else "http"
+        url = (f"{scheme}://{self.cfg.get('srs', 'host')}:{self.cfg.get('srs', 'port')}"
+               f"/v3/srtconns/get/{source['id']}")
+        try:
+            resp = self._session.get(url, headers=self._build_headers(), timeout=3)
+            resp.raise_for_status()
+            stats = self.parse_srt_conn(resp.json(), self._srt_prev)
+        except Exception:
+            # Link stats are optional; never let them break bitrate monitoring
+            self._emit_link_unavailable()
+            return
+        self._srt_prev = stats.pop("_counters")
+        self._link_was_available = True
+        self.link_stats.emit(stats)
+
+    @staticmethod
+    def parse_srt_conn(conn: dict, prev) -> dict:
+        """Turn one /v3/srtconns/get response into per-poll deltas.
+        prev is the "_counters" tuple from the previous call (or None). A new
+        connection id or a counter going backwards restarts from zero deltas."""
+        cid = conn.get("id", "")
+        received = int(conn.get("packetsReceived", 0))
+        lost = int(conn.get("packetsReceivedLoss", 0))
+        dropped = int(conn.get("packetsReceivedDrop", 0))
+        counters = (cid, received, lost, dropped)
+        if prev is None or prev[0] != cid or received < prev[1] or lost < prev[2] or dropped < prev[3]:
+            deltas = (0, 0, 0)
+        else:
+            deltas = (received - prev[1], lost - prev[2], dropped - prev[3])
+        return {
+            "available": True,
+            "received": deltas[0],
+            "lost": deltas[1],
+            "dropped": deltas[2],
+            "rtt_ms": float(conn.get("msRTT", 0.0)),
+            "_counters": counters,
+        }
 
     # ------------------------------------------------------------------
     # Generic endpoint helpers
@@ -287,6 +364,7 @@ class IngestPoller(QThread):
                     self.stream_online.emit(False, "")
                     self.bitrate_update.emit(0.0, 0.0, 0.0)
                     self._byte_samples.clear()
+                    self._emit_link_unavailable()
 
             except (requests.ConnectionError, requests.Timeout) as e:
                 # A hung server (timeout) is as unreachable as a refused one.
@@ -309,6 +387,7 @@ class IngestPoller(QThread):
                     self.stream_online.emit(False, "")
                     self.bitrate_update.emit(0.0, 0.0, 0.0)
                     self._byte_samples.clear()
+                    self._emit_link_unavailable()
                 else:
                     consecutive_failures += 1
                     self.connection_status.emit(False, f"HTTP {e.response.status_code}")
@@ -336,6 +415,7 @@ class IngestPoller(QThread):
             self.stream_online.emit(False, "")
             self.bitrate_update.emit(0.0, 0.0, 0.0)
             self._byte_samples.clear()
+            self._emit_link_unavailable()
 
     def stop(self):
         self._running = False

@@ -172,6 +172,28 @@ class DashboardTab(QWidget):
         self.btn_log_toggle.toggled.connect(self._on_log_toggle)
         graph_ctrl_row.addWidget(self.btn_log_toggle)
 
+        graph_ctrl_row.addSpacing(20)
+
+        # Rehearsal: run the real protection actions without a real outage
+        graph_ctrl_row.addWidget(QLabel("Rehearse:"))
+        self.btn_test_low = QPushButton("Test Low")
+        self.btn_test_low.setToolTip(
+            "Simulate low bitrate now: runs your Low Bitrate action in OBS.\n"
+            "Skips grace period and cooldown, plays alert sounds,\n"
+            "sends no webhooks, and isn't counted in session stats.\n"
+            "Ends automatically after 2 minutes."
+        )
+        self.btn_test_disc = QPushButton("Test Disconnect")
+        self.btn_test_disc.setToolTip(
+            "Simulate a disconnect now: runs your Disconnect action in OBS.\n"
+            "Same rules as Test Low."
+        )
+        self.btn_test_end = QPushButton("End Test")
+        self.btn_test_end.setToolTip("Stop the simulation and restore your scene/sources")
+        self.btn_test_end.setEnabled(False)
+        for b in (self.btn_test_low, self.btn_test_disc, self.btn_test_end):
+            graph_ctrl_row.addWidget(b)
+
         graph_ctrl_row.addStretch()
         layout.addLayout(graph_ctrl_row)
 
@@ -190,11 +212,21 @@ class DashboardTab(QWidget):
         self.card_average = StatCard("Average Bitrate")
         self.card_scene = StatCard("Current Scene", unit="")
         self.card_state = StatCard("Stream State", unit="")
+        self.card_link = StatCard("SRT Link (loss / RTT)", unit="")
+        self.card_link.setToolTip(
+            "Packet loss over the averaging window and smoothed round-trip time\n"
+            "of the SRT publisher. Available with the MediaMTX backend when\n"
+            "the stream arrives over SRT; shows n/a otherwise."
+        )
+        link_font = self.card_link._value.font()
+        link_font.setPointSize(14)
+        self.card_link._value.setFont(link_font)
 
         stats_panel.addWidget(self.card_current)
         stats_panel.addWidget(self.card_average)
         stats_panel.addWidget(self.card_scene)
         stats_panel.addWidget(self.card_state)
+        stats_panel.addWidget(self.card_link)
 
         # Session stats group
         session_group = QGroupBox("Session Stats")
@@ -368,7 +400,24 @@ class DashboardTab(QWidget):
             "LOW_BITRATE": self._colors["warning"],
             "DISCONNECTED": self._colors["danger"],
         }
-        self.card_state.set_value(state.replace("_", " ").title(), state_colors.get(state))
+        state_text = state.replace("_", " ").title()
+        if stats.get("test"):
+            state_text += " (TEST)"
+        self.card_state.set_value(state_text, state_colors.get(state))
+
+        # SRT link card
+        link = stats.get("link") or {}
+        if link.get("available"):
+            max_loss = self.cfg.get("thresholds", "max_packet_loss_pct")
+            max_rtt = self.cfg.get("thresholds", "max_rtt_ms")
+            bad = (max_loss > 0 and link["loss_pct"] > max_loss) or \
+                  (max_rtt > 0 and link["rtt_ms"] > max_rtt)
+            self.card_link.set_value(
+                f"{link['loss_pct']:.1f}% / {link['rtt_ms']:.0f} ms",
+                self._colors["warning"] if bad else None,
+            )
+        else:
+            self.card_link.set_value("n/a")
 
         # Session stats
         self.lbl_peak.setText(f"{stats.get('session_peak_kbps', 0):.0f} kbps")
@@ -379,6 +428,15 @@ class DashboardTab(QWidget):
         uptime = int(stats.get("uptime_s", 0))
         h, m, s = uptime // 3600, (uptime % 3600) // 60, uptime % 60
         self.lbl_uptime.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    def set_test_mode(self, state_name: str):
+        """Enable End Test only while a simulation runs."""
+        active = bool(state_name)
+        self.btn_test_end.setEnabled(active)
+        self.btn_test_end.setStyleSheet(
+            "background-color: #e0a030; color: black; border: none; "
+            "border-radius: 4px; padding: 7px 12px;" if active else ""
+        )
 
     def update_scene(self, scene_name: str):
         self.card_scene.set_value(scene_name or "—")

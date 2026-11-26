@@ -2,12 +2,17 @@
 Bitrate tracking engine.
 Maintains rolling window, computes averages, manages threshold state machine,
 and triggers scene switches / source visibility toggles via OBS client.
-Includes audio alert playback and webhook notification dispatch.
+Includes webhook notification dispatch; audio alerts are requested through
+the play_audio signal and played by the GUI thread.
+
+Threading (v1.2.0): MainWindow moves this object to its own QThread, so OBS
+requests made here can no longer freeze the window. Everything the GUI asks
+of the engine goes through the @pyqtSlot methods below via queued signals;
+the GUI reads engine data only from the stats_updated payload.
 """
 import time
 import csv
 import os
-import json
 import threading
 from collections import deque
 from enum import Enum, auto
@@ -17,10 +22,12 @@ from datetime import datetime, timezone
 import numpy as np
 import requests as http_requests
 
-from PyQt6.QtCore import QObject, pyqtSignal, QUrl
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from config_manager import APP_NAME, APP_INTERNAL_NAME
+
+# Simulated outages end on their own after this long, in case End Test is forgotten
+TEST_MODE_MAX_S = 120
 
 
 class StreamState(Enum):
@@ -29,14 +36,27 @@ class StreamState(Enum):
     DISCONNECTED = auto()
 
 
+def format_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
 class BitrateEngine(QObject):
     """Core bitrate analysis, scene-switching / source toggling, alerts."""
 
     state_changed = pyqtSignal(str, str)  # new_state, old_state
-    stats_updated = pyqtSignal(dict)  # {current, average, min, max, std, state, ...}
+    stats_updated = pyqtSignal(dict)  # {current, average, ..., "graph": [(t, kbps)], "link": {...}}
     scene_switch_triggered = pyqtSignal(str, str)  # new_scene, reason
     source_toggle_triggered = pyqtSignal(str, str, bool, str)  # scene, source, visible, reason
     log_entry = pyqtSignal(str)  # log message
+    play_audio = pyqtSignal(str, int)  # file path, volume 0-100 (played on the GUI thread)
+    test_mode_changed = pyqtSignal(str)  # "" when no test, else "LOW_BITRATE" / "DISCONNECTED"
 
     def __init__(self, config_manager, obs_client, parent=None):
         super().__init__(parent)
@@ -46,13 +66,18 @@ class BitrateEngine(QObject):
         # Rolling data
         self._history = deque()  # (timestamp, bitrate_kbps)
         self._graph_history = deque()  # full graph history
-        # Matches the dashboard Graph Window maximum (600 s); was 300, which
-        # silently capped the graph at 5 minutes.
+        # Matches the dashboard Graph Window maximum (600 s)
         self._max_graph_seconds = 600
+
+        # SRT link stats, per poll: (timestamp, packets_received_delta,
+        # packets_lost_delta, packets_dropped_delta, rtt_ms)
+        self._link_history = deque()
+        self._link_available = False
+        self._link_summary = {"available": False}
 
         # State machine
         self._state = StreamState.NORMAL
-        self._state_enter_time = 0.0
+        self._state_enter_time = time.time()
         self._last_switch_time = 0.0
         self._grace_start = 0.0
         self._in_grace = False
@@ -80,22 +105,19 @@ class BitrateEngine(QObject):
         # restart always comes back with protection active.
         self._override = False
 
+        # Test mode (simulated outage from the dashboard buttons)
+        self._test_state = None  # StreamState being simulated, or None
+        self._test_until = 0.0
+        self._period_is_test = False  # current state period started as a test
+
         # De-duplicates repeated log lines (cooldown, whitelist, OBS down)
         self._last_once_msg = ""
 
-        # Session stats
-        self._session_start = time.time()
-        self._total_samples = 0
-        self._total_bitrate = 0.0
-        self._peak_bitrate = 0.0
-        self._min_bitrate = float("inf")
-        self._drop_count = 0
-
         # Recent stats for stability check (populated each evaluate)
         self._last_std = 0.0
+        self._last_avg = 0.0
 
-        # Authoritative stream-online state from the ingest server. Set by
-        # main_window when ingest_client emits stream_online(...). Defaults
+        # Authoritative stream-online state from the ingest server. Defaults
         # to True so we don't trigger a false disconnect before the first
         # poll arrives.
         self._stream_online = True
@@ -103,36 +125,31 @@ class BitrateEngine(QObject):
         # Logging
         self._log_file = None
         self._csv_writer = None
+        self._pending_event = ""  # written into the next CSV row's event column
 
-        # Audio
-        self._audio_player = None
-        self._audio_output = None
-        self._init_audio()
+        self._reset_session_stats()
 
-    # --- Audio setup ---
+    def _reset_session_stats(self):
+        now = time.time()
+        self._session_start = now
+        self._total_samples = 0
+        self._total_bitrate = 0.0
+        self._peak_bitrate = 0.0
+        self._min_bitrate = float("inf")
+        self._drop_count = 0
+        # Real (non-test) seconds spent in each state, and outage tracking
+        self._time_in_state = {s: 0.0 for s in StreamState}
+        self._accum_from = now  # start of the not-yet-accumulated part of the current period
+        self._outage_start = None if self._state == StreamState.NORMAL else now
+        self._longest_outage = 0.0
 
-    def _init_audio(self):
-        try:
-            self._audio_player = QMediaPlayer()
-            self._audio_output = QAudioOutput()
-            self._audio_player.setAudioOutput(self._audio_output)
-        except Exception:
-            self._audio_player = None
-            self._audio_output = None
+    # --- Audio ---
 
     def _play_audio(self, file_path: str):
-        """Play an audio file for alert notification."""
-        if not self._audio_player or not file_path:
+        """Ask the GUI thread to play an alert sound (QMediaPlayer must live there)."""
+        if not file_path or not os.path.isfile(file_path):
             return
-        if not os.path.isfile(file_path):
-            return
-        try:
-            vol = self.cfg.get("notifications", "audio_volume") / 100.0
-            self._audio_output.setVolume(vol)
-            self._audio_player.setSource(QUrl.fromLocalFile(file_path))
-            self._audio_player.play()
-        except Exception as e:
-            self.log_entry.emit(f"Audio playback error: {e}")
+        self.play_audio.emit(file_path, int(self.cfg.get("notifications", "audio_volume")))
 
     # --- Webhook ---
 
@@ -165,35 +182,27 @@ class BitrateEngine(QObject):
 
         threading.Thread(target=_post, daemon=True).start()
 
-    def _fire_notifications(self, new_state: StreamState, avg_kbps: float):
-        """Dispatch audio and webhook notifications for a state transition."""
+    def _fire_notifications(self, new_state: StreamState, avg_kbps: float, test: bool = False):
+        """Dispatch audio and webhook notifications for a state transition.
+        Tests play the sounds (so they can be checked) but never send webhooks,
+        so a rehearsal doesn't alert a Discord channel."""
         audio_enabled = self.cfg.get("notifications", "audio_alerts")
-        webhook_enabled = self.cfg.get("notifications", "webhook_enabled")
+        webhook_enabled = self.cfg.get("notifications", "webhook_enabled") and not test
 
         bitrate_str = f"{avg_kbps:.0f}"
+        keys = {
+            StreamState.LOW_BITRATE: ("audio_low_bitrate", "webhook_low_bitrate_msg"),
+            StreamState.DISCONNECTED: ("audio_disconnect", "webhook_disconnect_msg"),
+            StreamState.NORMAL: ("audio_recovery", "webhook_recovery_msg"),
+        }
+        audio_key, msg_key = keys[new_state]
+        if audio_enabled:
+            self._play_audio(self.cfg.get("notifications", audio_key))
+        if webhook_enabled:
+            msg = self.cfg.get("notifications", msg_key)
+            self._send_webhook(msg.replace("{bitrate}", bitrate_str))
 
-        if new_state == StreamState.LOW_BITRATE:
-            if audio_enabled:
-                self._play_audio(self.cfg.get("notifications", "audio_low_bitrate"))
-            if webhook_enabled:
-                msg = self.cfg.get("notifications", "webhook_low_bitrate_msg")
-                self._send_webhook(msg.replace("{bitrate}", bitrate_str))
-
-        elif new_state == StreamState.DISCONNECTED:
-            if audio_enabled:
-                self._play_audio(self.cfg.get("notifications", "audio_disconnect"))
-            if webhook_enabled:
-                msg = self.cfg.get("notifications", "webhook_disconnect_msg")
-                self._send_webhook(msg.replace("{bitrate}", bitrate_str))
-
-        elif new_state == StreamState.NORMAL:
-            if audio_enabled:
-                self._play_audio(self.cfg.get("notifications", "audio_recovery"))
-            if webhook_enabled:
-                msg = self.cfg.get("notifications", "webhook_recovery_msg")
-                self._send_webhook(msg.replace("{bitrate}", bitrate_str))
-
-    # --- Properties ---
+    # --- Properties (thread-safe enough for tests and post-shutdown reads) ---
 
     @property
     def state(self) -> StreamState:
@@ -207,6 +216,13 @@ class BitrateEngine(QObject):
     def override(self) -> bool:
         return self._override
 
+    @property
+    def test_state(self):
+        return self._test_state
+
+    # --- Slots (called from the GUI thread through queued signals) ---
+
+    @pyqtSlot(bool)
     def set_override(self, enabled: bool):
         """Manual override: True stops all automatic OBS actions."""
         self._override = bool(enabled)
@@ -214,8 +230,57 @@ class BitrateEngine(QObject):
         self._in_grace = False
         self._in_recovery = False
 
+    @pyqtSlot(bool)
+    def set_logging(self, enabled: bool):
+        self.stop_logging()
+        if enabled:
+            self.start_logging()
+
+    @pyqtSlot()
+    def reset_session(self):
+        """Reset session statistics only. The state machine and any pending
+        scene/source restores are kept; clearing them mid-outage left OBS
+        stuck on the BRB scene."""
+        self.log_summary()
+        self._reset_session_stats()
+        self._history.clear()
+        self._graph_history.clear()
+
+    @pyqtSlot(str)
+    def simulate(self, kind: str):
+        """Rehearse the protection setup. kind: "low", "disconnect", or "" to end.
+
+        A test transition skips the grace period and cooldown, is not counted
+        in session stats, sends no webhooks, and ends automatically after
+        TEST_MODE_MAX_S. Real evaluation is paused while a test runs."""
+        now = time.time()
+        if kind in ("low", "disconnect"):
+            target = StreamState.LOW_BITRATE if kind == "low" else StreamState.DISCONNECTED
+            self._test_state = target
+            self._test_until = now + TEST_MODE_MAX_S
+            self.log_entry.emit(
+                f"TEST: simulating {target.name} (ends automatically after {TEST_MODE_MAX_S}s)"
+            )
+            if self._state != target:
+                self._transition_to(target, now, self._last_avg, test=True)
+            self.test_mode_changed.emit(target.name)
+        else:
+            self._end_test(now, "ended")
+
+    def _end_test(self, now: float, how: str):
+        if self._test_state is None:
+            return
+        self._test_state = None
+        self.log_entry.emit(f"TEST: {how}, returning to normal")
+        if self._state != StreamState.NORMAL:
+            self._transition_to(StreamState.NORMAL, now, self._last_avg, test=True)
+        self._in_grace = False
+        self._in_recovery = False
+        self.test_mode_changed.emit("")
+
     # --- Main processing ---
 
+    @pyqtSlot(float, float, float)
     def process_bitrate(self, total_kbps: float, video_kbps: float, audio_kbps: float):
         """Process a new bitrate sample. Called on every ingest poll."""
         now = time.time()
@@ -229,6 +294,8 @@ class BitrateEngine(QObject):
         cutoff = now - window_s
         while self._history and self._history[0][0] < cutoff:
             self._history.popleft()
+        while self._link_history and self._link_history[0][0] < cutoff:
+            self._link_history.popleft()
 
         # Trim graph history
         graph_cutoff = now - self._max_graph_seconds
@@ -244,6 +311,8 @@ class BitrateEngine(QObject):
             avg = 0.0
             std = 0.0
         self._last_std = std
+        self._last_avg = avg
+        self._link_summary = self._summarize_link()
 
         # Session stats
         self._total_samples += 1
@@ -254,6 +323,16 @@ class BitrateEngine(QObject):
 
         session_avg = self._total_bitrate / self._total_samples if self._total_samples else 0
 
+        # Test mode safety net
+        if self._test_state is not None and now >= self._test_until:
+            self._end_test(now, f"timed out after {TEST_MODE_MAX_S}s")
+
+        # Run state machine unless manual override or a test is active
+        if not self._override:
+            if self._test_state is None:
+                self._evaluate_thresholds(avg, now)
+            self._reconcile(now)
+
         stats = {
             "current_kbps": total_kbps,
             "video_kbps": video_kbps,
@@ -261,36 +340,83 @@ class BitrateEngine(QObject):
             "average_kbps": avg,
             "std_kbps": std,
             "state": self._state.name,
+            "test": self._test_state.name if self._test_state else "",
             "session_avg_kbps": session_avg,
             "session_peak_kbps": self._peak_bitrate,
             "session_min_kbps": self._min_bitrate if self._min_bitrate != float("inf") else 0,
             "session_drops": self._drop_count,
             "uptime_s": now - self._session_start,
             "samples_in_window": len(self._history),
+            "link": dict(self._link_summary),
+            # Snapshot for the graph: the GUI must not iterate the live deque
+            # from another thread.
+            "graph": list(self._graph_history),
         }
         self.stats_updated.emit(stats)
-
-        # Run state machine unless manual override is active
-        if not self._override:
-            self._evaluate_thresholds(avg, now)
-            self._reconcile(now)
 
         # Log
         self._write_log(now, total_kbps, avg, self._state.name)
 
-    def set_stream_online(self, online: bool):
-        """Called by main_window from ingest_client.stream_online signal.
-        Authoritative ingest-side indication of whether a publisher is
-        currently connected. Used by the false-positive-aware disconnect
-        logic; the same signal is emitted by all backends (Oryx, MediaMTX,
-        generic) so this works uniformly across them."""
+    @pyqtSlot(bool, str)
+    def set_stream_online(self, online: bool, stream_id: str = ""):
+        """Connected straight to ingest_client.stream_online. Authoritative
+        ingest-side indication of whether a publisher is currently connected.
+        Used by the false-positive-aware disconnect logic; every backend
+        (Oryx, MediaMTX, generic) emits it."""
         online = bool(online)
         if online and not self._stream_online:
             # Publisher just came back: drop the offline zeros from the
             # averaging window, otherwise recovery detours through LOW_BITRATE
             # (BRB -> Low Bitrate scene -> live) until they age out.
             self._history.clear()
+            self._link_history.clear()
         self._stream_online = online
+
+    @pyqtSlot(dict)
+    def set_link_stats(self, stats: dict):
+        """Connected to ingest_client.link_stats. stats is either
+        {"available": False} or per-poll deltas:
+        {"available": True, "received": n, "lost": n, "dropped": n, "rtt_ms": x}."""
+        if not stats.get("available"):
+            self._link_available = False
+            self._link_history.clear()
+            return
+        self._link_available = True
+        self._link_history.append((
+            time.time(),
+            max(int(stats.get("received", 0)), 0),
+            max(int(stats.get("lost", 0)), 0),
+            max(int(stats.get("dropped", 0)), 0),
+            float(stats.get("rtt_ms", 0.0)),
+        ))
+
+    def _summarize_link(self) -> dict:
+        """Loss and drop percentages over the averaging window, latest RTT."""
+        if not self._link_available or not self._link_history:
+            return {"available": False}
+        received = sum(h[1] for h in self._link_history)
+        lost = sum(h[2] for h in self._link_history)
+        dropped = sum(h[3] for h in self._link_history)
+        total = received + lost
+        return {
+            "available": True,
+            "loss_pct": (lost / total * 100.0) if total else 0.0,
+            "drop_pct": (dropped / total * 100.0) if total else 0.0,
+            "rtt_ms": self._link_history[-1][4],
+        }
+
+    def _link_problem(self) -> str:
+        """Reason text if SRT link quality crosses a configured limit, else ""."""
+        link = self._link_summary
+        if not link.get("available"):
+            return ""
+        max_loss = self.cfg.get("thresholds", "max_packet_loss_pct")
+        max_rtt = self.cfg.get("thresholds", "max_rtt_ms")
+        if max_loss > 0 and link["loss_pct"] > max_loss:
+            return f"packet loss {link['loss_pct']:.1f}% > {max_loss}%"
+        if max_rtt > 0 and link["rtt_ms"] > max_rtt:
+            return f"RTT {link['rtt_ms']:.0f} ms > {max_rtt} ms"
+        return ""
 
     def _target_state(self, avg_kbps: float) -> StreamState:
         low_thresh = self.cfg.get("thresholds", "low_bitrate_kbps")
@@ -313,6 +439,9 @@ class BitrateEngine(QObject):
         #     variation (std/avg) < cv_thresh. A real network problem produces
         #     erratic bitrate (high CV); a static scene at low encoder cost
         #     produces a smooth low plateau (low CV).
+        #   - OR the SRT link is in trouble (packet loss / RTT limits, off by
+        #     default). Not subject to the adaptive suppression: loss is a
+        #     network problem regardless of what the encoder is doing.
         if trust_offline:
             disconnected = not self._stream_online
         else:
@@ -320,6 +449,8 @@ class BitrateEngine(QObject):
 
         if disconnected:
             return StreamState.DISCONNECTED
+        if self._link_problem():
+            return StreamState.LOW_BITRATE
         if avg_kbps < low_thresh:
             if (
                 adaptive_floor > 0
@@ -380,9 +511,19 @@ class BitrateEngine(QObject):
             self._last_once_msg = msg
             self.log_entry.emit(msg)
 
-    def _transition_to(self, new_state: StreamState, now: float, avg_kbps: float) -> bool:
+
+    def _accumulate_time(self, now: float):
+        """Credit time since the last accumulation to the current state, unless
+        the current period is a test."""
+        if not self._period_is_test:
+            self._time_in_state[self._state] += max(now - self._accum_from, 0.0)
+        self._accum_from = now
+
+    def _transition_to(self, new_state: StreamState, now: float, avg_kbps: float,
+                       test: bool = False) -> bool:
         """Change state and run the matching OBS action. Returns False if the
-        cooldown blocked it (state unchanged)."""
+        cooldown blocked it (state unchanged). Test transitions skip the
+        cooldown, don't start one, and are kept out of session stats."""
         old_state = self._state
         cooldown_s = self.cfg.get("thresholds", "cooldown_s")
         since_last = now - self._last_switch_time
@@ -390,7 +531,7 @@ class BitrateEngine(QObject):
         # stream on the low-bitrate scene, so LOW -> DISCONNECTED bypasses it.
         escalation = old_state == StreamState.LOW_BITRATE and new_state == StreamState.DISCONNECTED
 
-        if since_last < cooldown_s and not escalation:
+        if since_last < cooldown_s and not escalation and not test:
             # Stable text so _log_once prints it once per blocked transition
             self._log_once(
                 f"COOLDOWN: transition to {new_state.name} held until the "
@@ -399,29 +540,44 @@ class BitrateEngine(QObject):
             return False
 
         self._last_once_msg = ""
+        reason = ""
+        if not test and new_state == StreamState.LOW_BITRATE:
+            reason = self._link_problem()
         self.log_entry.emit(
-            f"TRANSITION: {old_state.name} -> {new_state.name}, "
+            f"{'TEST ' if test else ''}TRANSITION: {old_state.name} -> {new_state.name}, "
             f"scene='{self.obs.current_scene}', avg={avg_kbps:.0f} kbps"
+            + (f", {reason}" if reason else "")
         )
+
+        # Session bookkeeping (real transitions only)
+        self._accumulate_time(now)
+        if not test:
+            if old_state == StreamState.NORMAL and new_state != StreamState.NORMAL:
+                self._drop_count += 1
+                self._outage_start = now
+            elif new_state == StreamState.NORMAL and self._outage_start is not None:
+                self._longest_outage = max(self._longest_outage, now - self._outage_start)
+                self._outage_start = None
+        self._period_is_test = test and new_state != StreamState.NORMAL
+        self._pending_event = f"{'TEST ' if test else ''}{old_state.name}->{new_state.name}"
 
         self._state = new_state
         self._state_enter_time = now
-        self._last_switch_time = now
+        if not test:
+            self._last_switch_time = now
 
         if new_state == StreamState.NORMAL:
             self._action_applied = True
             self._restore_all()
         else:
-            if old_state == StreamState.NORMAL:
-                self._drop_count += 1
-            else:
+            if old_state != StreamState.NORMAL:
                 # Leaving one protection state for the other: undo its source
                 # toggle first. Scene handling happens in _apply_protection.
                 self._undo_source_toggle(old_state.name)
             self._action_applied = False
             self._apply_protection(now)
 
-        self._fire_notifications(new_state, avg_kbps)
+        self._fire_notifications(new_state, avg_kbps, test=test)
         self.state_changed.emit(new_state.name, old_state.name)
         return True
 
@@ -576,6 +732,7 @@ class BitrateEngine(QObject):
                     f"{'visible' if original_vis else 'hidden'}"
                 )
 
+
     # --- Logging ---
 
     def start_logging(self):
@@ -588,7 +745,12 @@ class BitrateEngine(QObject):
         filepath = os.path.join(log_dir, filename)
         self._log_file = open(filepath, "w", newline="")
         self._csv_writer = csv.writer(self._log_file)
-        self._csv_writer.writerow(["timestamp", "bitrate_kbps", "avg_kbps", "state"])
+        # New columns are appended after the original four so existing
+        # spreadsheets/scripts that read by position keep working.
+        self._csv_writer.writerow([
+            "timestamp", "bitrate_kbps", "avg_kbps", "state",
+            "event", "packet_loss_pct", "rtt_ms",
+        ])
         self.log_entry.emit(f"Logging started: {filepath}")
 
     def stop_logging(self):
@@ -599,20 +761,44 @@ class BitrateEngine(QObject):
             self.log_entry.emit("Logging stopped")
 
     def _write_log(self, ts: float, bitrate: float, avg: float, state: str):
+        event, self._pending_event = self._pending_event, ""
         if self._csv_writer:
             dt = datetime.fromtimestamp(ts).isoformat()
-            self._csv_writer.writerow([dt, f"{bitrate:.1f}", f"{avg:.1f}", state])
+            link = self._link_summary
+            loss = f"{link['loss_pct']:.2f}" if link.get("available") else ""
+            rtt = f"{link['rtt_ms']:.0f}" if link.get("available") else ""
+            self._csv_writer.writerow([dt, f"{bitrate:.1f}", f"{avg:.1f}", state, event, loss, rtt])
             self._log_file.flush()
 
-    def reset_session(self):
-        """Reset session statistics only. The state machine and any pending
-        scene/source restores are kept; clearing them mid-outage (as before)
-        left OBS stuck on the BRB scene."""
-        self._session_start = time.time()
-        self._total_samples = 0
-        self._total_bitrate = 0.0
-        self._peak_bitrate = 0.0
-        self._min_bitrate = float("inf")
-        self._drop_count = 0
-        self._history.clear()
-        self._graph_history.clear()
+    # --- Session summary ---
+
+    def log_summary(self) -> str:
+        """Log the session summary and, if CSV logging is on, write it as a
+        row too (the Log tab is gone once the app has quit)."""
+        text = self.session_summary()
+        self.log_entry.emit(text)
+        if self._csv_writer:
+            self._csv_writer.writerow([datetime.now().isoformat(), "", "", self._state.name, text, "", ""])
+            self._log_file.flush()
+        return text
+
+    def session_summary(self, now: float = None) -> str:
+        """One-line summary of the session so far (real outages only)."""
+        now = time.time() if now is None else now
+        times = dict(self._time_in_state)
+        if not self._period_is_test:
+            times[self._state] += max(now - self._accum_from, 0.0)
+        longest = self._longest_outage
+        if self._outage_start is not None:
+            longest = max(longest, now - self._outage_start)
+        parts = [
+            f"SESSION SUMMARY: {format_duration(now - self._session_start)} monitored",
+            f"{self._drop_count} drop{'s' if self._drop_count != 1 else ''}",
+            f"low bitrate {format_duration(times[StreamState.LOW_BITRATE])}",
+            f"disconnected {format_duration(times[StreamState.DISCONNECTED])}",
+        ]
+        if self._drop_count:
+            parts.append(f"longest outage {format_duration(longest)}")
+        if self._total_samples:
+            parts.append(f"avg {self._total_bitrate / self._total_samples:.0f} kbps")
+        return ", ".join(parts)

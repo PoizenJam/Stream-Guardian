@@ -20,6 +20,8 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 - **Real-time bitrate graph** — rolling plot with current bitrate, average overlay, and threshold lines
 - **Configurable rolling average** over a user-specified window
 - **Session statistics** — peak, min, average, std dev, total drops, uptime
+- **Session summary** in the Log tab on Reset and on quit: drops, time spent in low bitrate and disconnected, longest outage
+- **SRT link quality** (MediaMTX with an SRT publisher) — packet loss and round-trip time on the dashboard, with optional limits that trigger low-bitrate protection
 
 ### Stream Protection (independently configurable per state)
 - **Scene switching mode** — switch to a designated OBS scene on low bitrate or disconnect
@@ -39,6 +41,7 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 - **Custom transition override** — use a specific OBS transition (e.g., Fade) for auto-switches; your own transition is put back afterwards
 - **Scene whitelist** — scenes exempt from auto-switching (e.g., "Starting Soon", "Ending")
 - Auto-reconnect with configurable retry interval
+- **Event-driven** — scene changes made in OBS are picked up instantly over an obs-websocket event connection (falls back to 1-second polling if events are unavailable)
 
 ### Notifications
 - **Audio alerts** — customizable sound files per event (low bitrate, disconnect, recovery) with volume control
@@ -52,6 +55,8 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 - Auto-switching always starts **ON** when the app launches
 - **Override toggle** — dashboard button + tray menu + hotkey all control the same state
 - **Always on top** mode
+- **Rehearse** — Test Low / Test Disconnect buttons run your real protection actions on demand, so you can check your BRB setup before going live (no grace period or cooldown, sounds play, no webhooks, not counted in stats, ends after 2 minutes)
+- **Responsive UI** — monitoring and OBS requests run on a background thread, so the window never freezes if OBS stalls
 - **Single instance** — launching a second copy shows a warning and brings the running window forward instead
 
 ### Configuration
@@ -60,7 +65,7 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 - **Light/Dark themes** matching OBS Studio design conventions
 
 ### Logging
-- **CSV bitrate logging** — timestamp, bitrate, average, state for every sample
+- **CSV bitrate logging** — timestamp, bitrate, average, state for every sample, plus an event column (state changes, tests) and SRT packet loss / RTT when available
 - **Event log** — scrolling in-app log with export capability
 
 ---
@@ -149,9 +154,9 @@ Output: `dist/StreamGuardian` (or `.exe` on Windows)
 stream-guardian/
 ├── main.py                 # Entry point
 ├── config_manager.py       # Persistent settings + preset management
-├── ingest_client.py        # Oryx / MediaMTX / generic API poller (background thread)
-├── obs_client.py           # OBS WebSocket client + source visibility control
-├── bitrate_engine.py       # State machine, audio alerts, webhook dispatch
+├── ingest_client.py        # Oryx / MediaMTX / generic API poller + SRT link stats (background thread)
+├── obs_client.py           # OBS WebSocket client (requests + events) + source visibility control
+├── bitrate_engine.py       # State machine, rehearsal mode, webhooks, CSV log, session summary (own thread)
 ├── single_instance.py      # Blocks a second copy; brings the running window forward
 ├── gui/
 │   ├── main_window.py      # Main window, menus, tray, hotkey binding
@@ -204,6 +209,9 @@ Each transition executes either a scene switch or source visibility toggle depen
 | Recovery Delay | 5 s | Stable seconds required before restoring |
 | Cooldown | 10 s | Minimum seconds between any auto-actions |
 | Override Hotkey | Ctrl+Shift+F12 | System-wide shortcut to toggle auto-switching |
+| Read SRT link stats | On | MediaMTX only: show packet loss and RTT for an SRT publisher |
+| Max Packet Loss | Off | Enter low-bitrate protection above this loss % (SRT) |
+| Max Round-Trip Time | Off | Enter low-bitrate protection above this RTT (SRT) |
 
 ---
 
@@ -215,6 +223,8 @@ Each transition executes either a scene switch or source visibility toggle depen
 - **Mix modes**: use source toggle for low bitrate (subtle) and scene switch for disconnect (obvious).
 - **Save presets** for different scenarios: "Local LAN", "Remote IRL", "Collab".
 - **Webhook templates** support `{bitrate}` placeholder for dynamic messages.
+- **Rehearse before you go live** with Test Low / Test Disconnect on the dashboard.
+- **SRT limits**: watch the SRT Link card on a good day first, then set Max Packet Loss a few points above your normal level.
 
 ---
 

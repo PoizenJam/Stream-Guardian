@@ -158,3 +158,44 @@ class TestSingleInstance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIngestParsing(unittest.TestCase):
+    def setUp(self):
+        from ingest_client import IngestPoller
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = ConfigManager(config_dir=self.tmp.name)
+        self.cfg.set("srs", "backend", "mediamtx")
+        self.cfg.set("srs", "stream_name", "cam")
+        self.cfg.set("srs", "link_stats_enabled", False)
+        self.poller = IngestPoller(self.cfg)
+        self.IngestPoller = IngestPoller
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_srt_deltas_and_reset(self):
+        parse = self.IngestPoller.parse_srt_conn
+        a = parse({"id": "x", "packetsReceived": 1000, "packetsReceivedLoss": 10,
+                   "packetsReceivedDrop": 1, "msRTT": 42.5}, None)
+        self.assertEqual((a["received"], a["lost"], a["dropped"], a["rtt_ms"]), (0, 0, 0, 42.5))
+        b = parse({"id": "x", "packetsReceived": 1900, "packetsReceivedLoss": 40,
+                   "packetsReceivedDrop": 3, "msRTT": 50}, a["_counters"])
+        self.assertEqual((b["received"], b["lost"], b["dropped"]), (900, 30, 2))
+        c = parse({"id": "y", "packetsReceived": 5, "packetsReceivedLoss": 0,
+                   "packetsReceivedDrop": 0, "msRTT": 20}, b["_counters"])
+        self.assertEqual((c["received"], c["lost"]), (0, 0))  # new connection
+
+    def test_mediamtx_online_preferred_over_ready(self):
+        # alwaysAvailable: path still "ready" with fallback content, publisher gone
+        found, _, _ = self.poller._poll_mediamtx({"name": "cam", "ready": True, "online": False,
+                                                  "inboundBytes": 1000})
+        self.assertFalse(found)
+        found, sid, total = self.poller._poll_mediamtx({"name": "cam", "online": True,
+                                                        "inboundBytes": 1000})
+        self.assertTrue(found)
+        self.assertIsNone(total)  # first sample: no rate yet
+
+    def test_mediamtx_old_server_fields(self):
+        found, _, _ = self.poller._poll_mediamtx({"name": "cam", "ready": True, "bytesReceived": 10})
+        self.assertTrue(found)

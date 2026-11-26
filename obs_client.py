@@ -8,11 +8,19 @@ ReqClient is a single websocket that sends a request and then reads "the next"
 response, so two threads using it at once can read each other's replies.
 Every request therefore goes through _req(), which holds an RLock for the
 whole send/receive.
+
+Events (v1.2.0): a second websocket (obsws-python EventClient, its own
+thread) delivers CurrentProgramSceneChanged and scene list changes the moment
+they happen, so a manual scene change during an outage is seen immediately.
+The request connection is then only polled every KEEPALIVE_POLL_S as a health
+check. If the event connection can't be opened, the 1-second polling of
+v1.1.0 is used instead.
 """
 import threading
 
 import obsws_python as obs
 from obsws_python.error import OBSSDKRequestError
+from obsws_python.subs import Subs
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 
 # Requests that take longer than this mark the connection as lost. Kept short
@@ -22,6 +30,9 @@ REQUEST_TIMEOUT_S = 3
 # Refresh the scene list every N one-second polls so scenes added in OBS
 # after connecting show up in the settings combos without a restart.
 SCENE_LIST_REFRESH_POLLS = 15
+
+# Poll interval while the event connection is up (health check only)
+KEEPALIVE_POLL_S = 5
 
 
 class OBSClient(QThread):
@@ -49,6 +60,10 @@ class OBSClient(QThread):
         # (name, duration_ms) of the user's own transition while a custom one is
         # temporarily active for an auto-switch; None when nothing to restore.
         self._transition_restore = None
+        # Event connection (None when unavailable -> 1 s polling)
+        self._events = None
+        self._scene_list_dirty = False
+        self._obs_exiting = False
 
     @property
     def is_connected(self):
@@ -72,7 +87,10 @@ class OBSClient(QThread):
             else:
                 self._poll_state()
 
-            interval_s = self.cfg.get("obs", "reconnect_interval_s") if not self._connected else 1
+            if not self._connected:
+                interval_s = self.cfg.get("obs", "reconnect_interval_s")
+            else:
+                interval_s = KEEPALIVE_POLL_S if self._events_alive() else 1
             self._interruptible_sleep(interval_s)
 
         self._disconnect()
@@ -81,7 +99,9 @@ class OBSClient(QThread):
         # Reconnect interval can be up to 300 s; sleeping it in one go made stop()
         # time out and left the thread running at process exit.
         remaining_ms = int(seconds * 1000)
-        while self._running and remaining_ms > 0:
+        # Also wake early when an event asks for work (scene list change, OBS exiting)
+        while self._running and remaining_ms > 0 and not self._scene_list_dirty \
+                and not self._obs_exiting:
             step = min(100, remaining_ms)
             self.msleep(step)
             remaining_ms -= step
@@ -103,7 +123,11 @@ class OBSClient(QThread):
                 self._ws = ws
                 self._connected = True
 
-            self.connected.emit(True, f"Connected to OBS at {host}:{port}")
+            events_ok = self._start_events(host, port, password)
+            self.connected.emit(
+                True,
+                f"Connected to OBS at {host}:{port}" + ("" if events_ok else " (polling, no events)"),
+            )
             self._refresh_scene_list(force_emit=True)
             self._refresh_transitions()
             self._poll_current_scene()
@@ -114,10 +138,78 @@ class OBSClient(QThread):
                 self._ws = None
             self.connected.emit(False, f"OBS: {str(e)[:80]}")
 
+    # --- Event connection ---
+
+    def _start_events(self, host, port, password) -> bool:
+        """Open the event websocket. Callbacks run on obsws-python's event
+        thread; obsws matches them by function name, hence the on_* names."""
+        self._stop_events()
+        client = self
+
+        def on_current_program_scene_changed(data):
+            try:
+                scene = getattr(data, "scene_name", "") or ""
+                if scene and scene != client._current_scene:
+                    client._current_scene = scene
+                    client.scene_changed.emit(scene)
+            except Exception:
+                pass  # an exception here would kill obsws's event thread
+
+        def on_scene_created(data):
+            client._scene_list_dirty = True
+
+        def on_scene_removed(data):
+            client._scene_list_dirty = True
+
+        def on_scene_name_changed(data):
+            client._scene_list_dirty = True
+
+        def on_exit_started(data):
+            # OBS is closing; the poll thread drops the connection (never call
+            # EventClient.disconnect from its own thread: it joins itself)
+            client._obs_exiting = True
+
+        try:
+            ev = obs.EventClient(
+                host=host, port=port, password=password if password else None,
+                timeout=REQUEST_TIMEOUT_S, subs=Subs.GENERAL | Subs.SCENES,
+            )
+            ev.callback.register([
+                on_current_program_scene_changed, on_scene_created, on_scene_removed,
+                on_scene_name_changed, on_exit_started,
+            ])
+            self._events = ev
+            return True
+        except Exception as e:
+            self._events = None
+            self.error.emit(f"OBS events unavailable, using 1 s polling: {str(e)[:80]}")
+            return False
+
+    def _events_alive(self) -> bool:
+        ev = self._events
+        worker = getattr(ev, "worker", None) if ev else None
+        return bool(worker and worker.is_alive())
+
+    def _stop_events(self):
+        # Flags only mean something for a live connection; leaving them set
+        # would make the reconnect sleep return immediately (busy loop).
+        self._scene_list_dirty = False
+        self._obs_exiting = False
+        ev, self._events = self._events, None
+        if ev is None:
+            return
+        try:
+            ev.base_client.ws.close()
+            if threading.current_thread() is not ev.worker:
+                ev.worker.join(timeout=2)
+        except Exception:
+            pass
+
     def _disconnect(self):
         with self._lock:
             self._connected = False
             ws, self._ws = self._ws, None
+        self._stop_events()
         if ws:
             try:
                 ws.disconnect()
@@ -129,6 +221,7 @@ class OBSClient(QThread):
             was_connected = self._connected
             self._connected = False
             ws, self._ws = self._ws, None
+        self._stop_events()
         if ws:
             try:
                 ws.disconnect()
@@ -160,12 +253,21 @@ class OBSClient(QThread):
         raise ConnectionError(str(lost))
 
     def _poll_state(self):
+        if self._obs_exiting:
+            self._mark_lost("OBS is closing")
+            return
         try:
             self._poll_current_scene()
-            self._polls_since_scene_refresh += 1
-            if self._polls_since_scene_refresh >= SCENE_LIST_REFRESH_POLLS:
+            if self._scene_list_dirty:
+                self._scene_list_dirty = False
                 self._polls_since_scene_refresh = 0
                 self._refresh_scene_list()
+            elif not self._events_alive():
+                # No events: refresh the list periodically instead
+                self._polls_since_scene_refresh += 1
+                if self._polls_since_scene_refresh >= SCENE_LIST_REFRESH_POLLS:
+                    self._polls_since_scene_refresh = 0
+                    self._refresh_scene_list()
         except ConnectionError:
             pass  # _req already marked the connection lost and emitted
         except Exception:

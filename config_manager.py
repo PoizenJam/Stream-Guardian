@@ -18,7 +18,7 @@ from pathlib import Path
 # === App identity — change these to rename/version the app ===
 APP_NAME = "Stream Guardian"           # Display name (window title, tray, webhooks)
 APP_INTERNAL_NAME = "StreamGuardian"   # Folder/exe name (no spaces, used for paths)
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 DEFAULT_CONFIG = {
     "srs": {
@@ -34,6 +34,9 @@ DEFAULT_CONFIG = {
         "use_raw_bitrate": True,
         "raw_bitrate_avg_window": 3,
         "generic_bitrate_key": "",      # dot-path into JSON for generic mode
+        # MediaMTX only: also read SRT link stats (packet loss, RTT) for the
+        # connected publisher. One extra API request per poll.
+        "link_stats_enabled": True,
     },
     "obs": {
         "host": "localhost",
@@ -67,6 +70,12 @@ DEFAULT_CONFIG = {
         # considered "stable adaptive" rather than "network-troubled".
         # 0.25 means std must be under 25% of the mean. Lower = stricter.
         "stability_cv_threshold": 0.25,
+        # --- SRT link quality triggers (MediaMTX + SRT publisher only) ---
+        # Enter LOW_BITRATE when packet loss over the averaging window exceeds
+        # this percentage, or the smoothed round-trip time exceeds this many
+        # milliseconds. 0 disables each check.
+        "max_packet_loss_pct": 0.0,
+        "max_rtt_ms": 0,
     },
     "scenes": {
         "low_bitrate_scene": "Low Bitrate",
