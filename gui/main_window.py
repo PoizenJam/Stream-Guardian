@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QMenu, QMenuBar, QStatusBar, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor
 
 from config_manager import ConfigManager, APP_NAME, APP_INTERNAL_NAME, APP_VERSION
 from ingest_client import IngestPoller
@@ -19,6 +19,7 @@ from gui.dashboard import DashboardTab
 from gui.settings_tab import SettingsTab
 from gui.presets_tab import PresetsTab
 from gui.log_tab import LogTab
+from gui.global_hotkey import GlobalHotkey
 from gui.themes import DARK_STYLESHEET, LIGHT_STYLESHEET, COLORS_DARK
 
 
@@ -88,6 +89,9 @@ class MainWindow(QMainWindow):
 
         # Connect signals
         self._connect_signals()
+
+        if self.cfg.load_message:
+            self.tab_log.append(f"CONFIG: {self.cfg.load_message}")
 
         # Apply theme
         self._apply_theme()
@@ -179,7 +183,7 @@ class MainWindow(QMainWindow):
         act_show = tray_menu.addAction("Show")
         act_show.triggered.connect(self._show_from_tray)
 
-        self._tray_override_action = tray_menu.addAction("Toggle Auto-Switch")
+        self._tray_override_action = tray_menu.addAction("Turn Auto-Switch OFF")
         self._tray_override_action.triggered.connect(self._toggle_override_from_tray)
 
         tray_menu.addSeparator()
@@ -191,21 +195,16 @@ class MainWindow(QMainWindow):
         self._tray.show()
 
     def _build_hotkey(self):
-        """Set up the global override hotkey from config."""
-        hotkey_str = self.cfg.get("override", "hotkey")
-        self._hotkey_shortcut = None
-        if hotkey_str:
-            try:
-                seq = QKeySequence(hotkey_str)
-                if not seq.isEmpty():
-                    self._hotkey_shortcut = QShortcut(seq, self)
-                    self._hotkey_shortcut.setContext(
-                        Qt.ShortcutContext.ApplicationShortcut
-                    )
-                    self._hotkey_shortcut.activated.connect(self._toggle_override_hotkey)
-                    self.tab_log.append(f"Override hotkey registered: {hotkey_str}")
-            except Exception as e:
-                self.tab_log.append(f"Failed to register hotkey '{hotkey_str}': {e}")
+        """Create the system-wide override hotkey and register it from config."""
+        self._hotkey = GlobalHotkey(self, parent=self)
+        self._hotkey.activated.connect(self._toggle_override_hotkey)
+        self._register_hotkey()
+
+    def _register_hotkey(self):
+        try:
+            self.tab_log.append(self._hotkey.register(self.cfg.get("override", "hotkey")))
+        except Exception as e:
+            self.tab_log.append(f"Failed to register hotkey: {e}")
 
     def _connect_signals(self):
         # SRS signals
@@ -313,7 +312,12 @@ class MainWindow(QMainWindow):
     # --- Override ---
 
     def _on_override_toggle(self, enabled: bool):
-        self.cfg.set("override", "enabled", enabled)
+        # Engine-held, not saved to config: a restart always resumes protection
+        self.engine.set_override(enabled)
+        if self._tray:
+            self._tray_override_action.setText(
+                "Turn Auto-Switch ON" if enabled else "Turn Auto-Switch OFF"
+            )
         btn = self.tab_dashboard.btn_override
         if enabled:
             btn.setText("⏸ Auto-Switch OFF")
@@ -346,11 +350,11 @@ class MainWindow(QMainWindow):
         # Refresh dashboard ingest label (SRS / MediaMTX / Ingest)
         self.tab_dashboard.refresh_ingest_label()
 
-        # Rebuild hotkey
-        if self._hotkey_shortcut:
-            self._hotkey_shortcut.setEnabled(False)
-            self._hotkey_shortcut = None
-        self._build_hotkey()
+        # Re-register hotkey (takes effect immediately, no restart needed)
+        self._register_hotkey()
+
+        # Graph line visibility options
+        self.tab_dashboard.refresh_graph_options()
 
         # Sync dashboard log button with settings
         log_enabled = self.cfg.get("logging", "enabled")
@@ -375,10 +379,11 @@ class MainWindow(QMainWindow):
         self._apply_on_top(on_top)
 
     def _on_preset_loaded(self):
+        # Run the full settings-changed path so logging, hotkey, always-on-top
+        # and graph options follow the preset, not just the Settings tab fields.
         self.tab_settings._load_from_config()
-        self._apply_theme()
-        self.tab_dashboard.refresh_ingest_label()
-        self.tab_log.append("Preset loaded — settings refreshed")
+        self._on_settings_changed()
+        self.tab_log.append("Preset loaded, settings refreshed")
 
     # --- Theme ---
 
@@ -406,11 +411,16 @@ class MainWindow(QMainWindow):
 
     def _apply_on_top(self, on_top):
         flags = self.windowFlags()
-        if on_top:
-            self.setWindowFlags(flags | Qt.WindowType.WindowStaysOnTopHint)
-        else:
-            self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
-        self.show()
+        new_flags = (flags | Qt.WindowType.WindowStaysOnTopHint) if on_top \
+            else (flags & ~Qt.WindowType.WindowStaysOnTopHint)
+        if new_flags == flags:
+            return
+        # setWindowFlags hides the window; only re-show it if it was visible,
+        # so applying settings doesn't pop the window out of the tray.
+        was_visible = self.isVisible()
+        self.setWindowFlags(new_flags)
+        if was_visible:
+            self.show()
 
     # --- Tray ---
 
@@ -458,9 +468,10 @@ class MainWindow(QMainWindow):
         self.tab_log.append("Shutting down...")
         # Auto-save current UI settings so nothing is lost on close
         try:
-            self.tab_settings._apply()
+            self.tab_settings._apply(emit=False)
         except Exception:
             pass
+        self._hotkey.unregister()
         self.engine.stop_logging()
         self.srs.stop()
         self.obs.stop()
@@ -486,7 +497,7 @@ class MainWindow(QMainWindow):
             "<li>Custom OBS transitions for auto-switches</li>"
             "<li>Customizable audio alerts per event</li>"
             "<li>Discord / Slack / custom webhook notifications</li>"
-            "<li>Global hotkey for manual override toggle</li>"
+            "<li>System-wide hotkey for manual override toggle</li>"
             "<li>Persistent settings with save/load presets</li>"
             "<li>CSV bitrate logging</li>"
             "<li>System tray support</li>"

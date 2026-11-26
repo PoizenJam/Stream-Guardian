@@ -25,17 +25,18 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 - **Scene switching mode** — switch to a designated OBS scene on low bitrate or disconnect
 - **Source visibility mode** — toggle specific source visibility within a scene instead of switching
 - Each mode (low bitrate, disconnect) is independently configured — mix and match
-- Automatic restoration when bitrate recovers
+- Automatic restoration when bitrate recovers (skipped if you changed scenes yourself during the outage)
+- Actions that couldn't run (OBS disconnected, whitelisted scene) are retried automatically once possible
 
 ### Stability & Reliability
 - **Grace period** — wait N seconds below threshold before triggering (avoids false positives)
 - **Recovery delay** — require N seconds of stable bitrate before switching back
-- **Cooldown timer** — minimum time between any two auto-switches (prevents rapid flipping)
+- **Cooldown timer** — minimum time between auto-switches (prevents rapid flipping); escalation to Disconnected is never delayed
 - **Hysteresis** — the three above combine to create robust, jitter-free behavior
 
 ### OBS Integration
 - Connects via built-in **OBS WebSocket** (OBS 28+)
-- **Custom transition override** — use a specific OBS transition (e.g., Fade) for auto-switches
+- **Custom transition override** — use a specific OBS transition (e.g., Fade) for auto-switches; your own transition is put back afterwards
 - **Scene whitelist** — scenes exempt from auto-switching (e.g., "Starting Soon", "Ending")
 - Auto-reconnect with configurable retry interval
 
@@ -47,7 +48,8 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 
 ### Operational
 - **System tray mode** — minimize to tray for unobtrusive monitoring
-- **Manual override hotkey** — configurable keyboard shortcut to toggle auto-switching
+- **Manual override hotkey** — configurable system-wide keyboard shortcut to toggle auto-switching (works while OBS or a game has focus on Windows)
+- Auto-switching always starts **ON** when the app launches
 - **Override toggle** — dashboard button + tray menu + hotkey all control the same state
 - **Always on top** mode
 - **Single instance** — launching a second copy shows a warning and brings the running window forward instead
@@ -67,7 +69,7 @@ Download the latest `StreamGuardian-X.Y.Z-Windows.zip` from the [Releases page](
 
 - **Python 3.10+**
 - **OBS Studio 28+** (built-in WebSocket server)
-- **Oryx SRS** media server (or any SRS-based server with the stats API)
+- An ingest server with an HTTP stats API: **Oryx / SRS**, **MediaMTX**, or any JSON endpoint (generic mode)
 
 ### Python Dependencies
 
@@ -86,7 +88,7 @@ numpy>=1.24
 ### 1. Install
 
 ```bash
-cd bitrate-guardian
+cd stream-guardian
 pip install -r requirements.txt
 ```
 
@@ -102,7 +104,7 @@ python main.py
 
 ### 4. Configure in the Settings tab
 
-1. **SRS Connection** — set your Oryx SRS host/port
+1. **Ingest Server** — choose the backend (Oryx, MediaMTX, generic) and set host/port
 2. **OBS Connection** — match your OBS WebSocket settings
 3. **Thresholds** — set low bitrate and disconnect thresholds
 4. **Low Bitrate Protection** — choose Scene Switch or Source Visibility Toggle, configure target
@@ -137,17 +139,17 @@ build.bat
 chmod +x build.sh && ./build.sh
 ```
 
-Output: `dist/BitrateGuardian` (or `.exe` on Windows)
+Output: `dist/StreamGuardian` (or `.exe` on Windows)
 
 ---
 
 ## Architecture
 
 ```
-bitrate-guardian/
+stream-guardian/
 ├── main.py                 # Entry point
 ├── config_manager.py       # Persistent settings + preset management
-├── srs_client.py           # Oryx SRS API poller (background thread)
+├── ingest_client.py        # Oryx / MediaMTX / generic API poller (background thread)
 ├── obs_client.py           # OBS WebSocket client + source visibility control
 ├── bitrate_engine.py       # State machine, audio alerts, webhook dispatch
 ├── single_instance.py      # Blocks a second copy; brings the running window forward
@@ -157,7 +159,9 @@ bitrate-guardian/
 │   ├── settings_tab.py     # All config with protection mode widgets
 │   ├── presets_tab.py      # Preset save/load/import/export
 │   ├── log_tab.py          # Event log viewer
+│   ├── global_hotkey.py    # System-wide override hotkey (RegisterHotKey on Windows)
 │   └── themes.py           # OBS-style dark/light themes
+├── tests/                  # Unit tests (python -m unittest discover -s tests)
 ├── requirements.txt
 ├── build.spec              # PyInstaller build config
 ├── build.bat / build.sh    # Build scripts
@@ -185,7 +189,7 @@ bitrate-guardian/
                     └───────────────────────┘
 ```
 
-Each transition executes either a scene switch or source visibility toggle depending on the per-state mode configuration. When escalating from LOW_BITRATE → DISCONNECTED, the low-bitrate action is undone before the disconnect action is applied.
+Each transition executes either a scene switch or source visibility toggle depending on the per-state mode configuration. When moving between LOW_BITRATE and DISCONNECTED, the previous state's action is undone before the new one is applied. Escalating from LOW_BITRATE to DISCONNECTED is immediate and is not held back by the cooldown.
 
 ---
 
@@ -199,7 +203,7 @@ Each transition executes either a scene switch or source visibility toggle depen
 | Grace Period | 3 s | Seconds below threshold before triggering |
 | Recovery Delay | 5 s | Stable seconds required before restoring |
 | Cooldown | 10 s | Minimum seconds between any auto-actions |
-| Override Hotkey | Ctrl+Shift+F12 | Global shortcut to toggle auto-switching |
+| Override Hotkey | Ctrl+Shift+F12 | System-wide shortcut to toggle auto-switching |
 
 ---
 

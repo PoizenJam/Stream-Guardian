@@ -2,7 +2,7 @@
 Ingest server API client for polling stream bitrate.
 Supports multiple backends:
   - Oryx SRS: polls /api/v1/streams/ for recv_bytes / recv_30s
-  - MediaMTX:  polls /v3/paths/list for bytesReceived deltas
+  - MediaMTX:  polls /v3/paths/get/<name> for bytesReceived deltas
   - Generic:   polls a user-supplied JSON endpoint; uses JSONPath-style
                key to extract a numeric bitrate value (kbps)
 
@@ -96,14 +96,16 @@ class IngestPoller(QThread):
                         return s
         return None
 
-    def _compute_raw_bitrate_srs(self, stream: dict) -> float:
+    def _compute_raw_bitrate_srs(self, stream: dict) -> float | None:
         recv_bytes = int(stream.get("recv_bytes", 0))
         live_ms    = int(stream.get("live_ms", 0))
 
         self._byte_samples.append((live_ms, recv_bytes))
 
+        # One sample can't give a rate. Returning 0 here used to feed a fake
+        # 0 kbps reading into the average on every reconnect.
         if len(self._byte_samples) < 2:
-            return 0.0
+            return None
 
         window = min(
             int(self.cfg.get("srs", "raw_bitrate_avg_window")),
@@ -134,7 +136,7 @@ class IngestPoller(QThread):
                 return float(pub_kbps.get("recv_30s", 0))
         return 0.0
 
-    def _poll_oryx(self, data: dict) -> tuple[bool, str, float]:
+    def _poll_oryx(self, data: dict) -> tuple[bool, str, float | None]:
         """Returns (stream_found, stream_id, total_kbps)."""
         if data.get("code", -1) != 0:
             return False, "", 0.0
@@ -154,7 +156,7 @@ class IngestPoller(QThread):
     # MediaMTX helpers
     # ------------------------------------------------------------------
 
-    def _poll_mediamtx(self, data: dict) -> tuple[bool, str, float]:
+    def _poll_mediamtx(self, data: dict) -> tuple[bool, str, float | None]:
         """Parse MediaMTX response.
 
         /v3/paths/get/<name> returns a single path object directly.
@@ -196,8 +198,9 @@ class IngestPoller(QThread):
         now_ms = int(time.time() * 1000)
         self._byte_samples.append((now_ms, bytes_received))
 
-        total = 0.0
+        total = None  # first sample after (re)connect: no rate yet
         if len(self._byte_samples) >= 2:
+            total = 0.0
             window = min(
                 int(self.cfg.get("srs", "raw_bitrate_avg_window")),
                 len(self._byte_samples) - 1,
@@ -278,22 +281,23 @@ class IngestPoller(QThread):
 
                 if found:
                     self.stream_online.emit(True, sid)
-                    self.bitrate_update.emit(total, total, 0.0)
+                    if total is not None:
+                        self.bitrate_update.emit(total, total, 0.0)
                 else:
                     self.stream_online.emit(False, "")
                     self.bitrate_update.emit(0.0, 0.0, 0.0)
                     self._byte_samples.clear()
 
-            except requests.ConnectionError:
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # A hung server (timeout) is as unreachable as a refused one.
+                # Timeouts used to be excluded, so the engine received no
+                # samples at all and could never react.
                 consecutive_failures += 1
-                self.connection_status.emit(False, "Cannot connect to server")
-                if consecutive_failures >= max_fail_before_offline:
-                    self.stream_online.emit(False, "")
-                    self.bitrate_update.emit(0.0, 0.0, 0.0)
-                    self._byte_samples.clear()
-            except requests.Timeout:
-                consecutive_failures += 1
-                self.connection_status.emit(False, "Request timeout")
+                is_timeout = isinstance(e, requests.Timeout)
+                self.connection_status.emit(
+                    False, "Request timeout" if is_timeout else "Cannot connect to server"
+                )
+                self._offline_if_persistent(consecutive_failures, max_fail_before_offline)
             except requests.HTTPError as e:
                 # MediaMTX returns 404 from /v3/paths/get/<n> when the path
                 # doesn't exist (i.e. publisher disconnected and on-demand path
@@ -308,20 +312,33 @@ class IngestPoller(QThread):
                 else:
                     consecutive_failures += 1
                     self.connection_status.emit(False, f"HTTP {e.response.status_code}")
+                    self._offline_if_persistent(consecutive_failures, max_fail_before_offline)
             except Exception as e:
                 consecutive_failures += 1
                 self.error.emit(str(e))
+                self._offline_if_persistent(consecutive_failures, max_fail_before_offline)
 
-            self.msleep(interval_ms)
+            # Sleep in slices so stop() isn't stuck behind a long poll interval
+            remaining = int(interval_ms)
+            while self._running and remaining > 0:
+                step = min(100, remaining)
+                self.msleep(step)
+                remaining -= step
 
         if self._session:
             self._session.close()
 
+    def _offline_if_persistent(self, failures: int, limit: int):
+        """Any repeated failure (refused, timeout, HTTP error, bad JSON) means
+        the stream can't be seen; report it offline so the disconnect logic
+        can act. Previously only refused connections did this."""
+        if failures >= limit:
+            self.stream_online.emit(False, "")
+            self.bitrate_update.emit(0.0, 0.0, 0.0)
+            self._byte_samples.clear()
+
     def stop(self):
         self._running = False
-        # Wait for the run loop to exit so the process can terminate
-        # cleanly. Poll interval is typically 1s, so 3s is comfortably
-        # longer than one loop iteration.
-        if self.isRunning():
-            self.wait(3000)
-        self.wait(3000)
+        # An in-flight request can take up to its 5 s timeout; the sleep
+        # between polls is interruptible, so 7 s covers the worst case.
+        self.wait(7000)

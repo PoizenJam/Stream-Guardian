@@ -1,12 +1,12 @@
 @echo off
 echo ========================================
-echo  Building Bitrate Guardian
+echo  Building Stream Guardian
 echo ========================================
 echo.
 
 REM Install dependencies
 echo Installing dependencies...
-pip install -r requirements.txt
+pip install -r requirements.txt pyinstaller
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies
     pause
@@ -25,6 +25,6 @@ if errorlevel 1 (
 echo.
 echo ========================================
 echo  Build complete!
-echo  Output: dist\BitrateGuardian.exe
+echo  Output: dist\StreamGuardian.exe
 echo ========================================
 pause

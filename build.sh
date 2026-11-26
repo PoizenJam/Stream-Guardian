@@ -2,12 +2,12 @@
 set -e
 
 echo "========================================"
-echo " Building Bitrate Guardian"
+echo " Building Stream Guardian"
 echo "========================================"
 echo
 
 echo "Installing dependencies..."
-pip install -r requirements.txt
+pip install -r requirements.txt pyinstaller
 
 echo
 echo "Building executable..."
@@ -16,5 +16,5 @@ pyinstaller build.spec --clean
 echo
 echo "========================================"
 echo " Build complete!"
-echo " Output: dist/BitrateGuardian"
+echo " Output: dist/StreamGuardian"
 echo "========================================"

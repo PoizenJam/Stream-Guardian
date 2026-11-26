@@ -124,12 +124,15 @@ class ProtectionModeWidget(QWidget):
 class SettingsTab(QWidget):
     settings_changed = pyqtSignal()
     request_sources = pyqtSignal(str, str)  # scene_name, state_key (for routing response)
+    # Emitted from the webhook test thread; delivered on the GUI thread
+    _webhook_test_result = pyqtSignal(bool, str)
 
     def __init__(self, config_manager, parent=None):
         super().__init__(parent)
         self.cfg = config_manager
         self._build_ui()
         self._load_from_config()
+        self._webhook_test_result.connect(self._show_webhook_test_result)
 
     def _build_ui(self):
         scroll = QScrollArea()
@@ -537,14 +540,13 @@ class SettingsTab(QWidget):
         self.hotkey_edit = QLineEdit()
         self.hotkey_edit.setPlaceholderText("e.g. Ctrl+Shift+F12")
         self.hotkey_edit.setToolTip(
-            "Global keyboard shortcut to toggle auto-switching on/off.\n"
+            "System-wide keyboard shortcut to toggle auto-switching on/off,\n"
+            "including while OBS or a game has focus (Windows).\n"
             "Use format: Ctrl+Shift+F12, Alt+F9, etc.\n"
-            "Requires restart to take effect."
+            "Takes effect when you click Apply Settings.\n"
+            "The Log tab says if another app already owns the combination."
         )
         hotkey_layout.addWidget(self.hotkey_edit, stretch=1)
-        lbl_note = QLabel("(Restart required for hotkey changes)")
-        lbl_note.setProperty("dim", True)
-        hotkey_layout.addWidget(lbl_note)
         hotkey_group.setLayout(hotkey_layout)
         main_layout.addWidget(hotkey_group)
 
@@ -851,7 +853,14 @@ class SettingsTab(QWidget):
         action = c.get("scenes", f"{key}_source_action")
         widget.action_combo.setCurrentText(action)
 
-    def _apply(self):
+    def _apply(self, emit: bool = True):
+        # One save at the end instead of one file write per field
+        with self.cfg.batch():
+            self._apply_fields()
+        if emit:
+            self.settings_changed.emit()
+
+    def _apply_fields(self):
         c = self.cfg
 
         c.set("srs", "backend", self.srs_backend.currentText())
@@ -919,9 +928,6 @@ class SettingsTab(QWidget):
         c.set("gui", "theme", self.gui_theme.currentText())
         c.set("gui", "minimize_to_tray", self.gui_minimize_tray.isChecked())
         c.set("gui", "always_on_top", self.gui_always_top.isChecked())
-
-        c.save()
-        self.settings_changed.emit()
 
     def _apply_protection(self, widget: ProtectionModeWidget, key: str):
         c = self.cfg
@@ -995,12 +1001,21 @@ class SettingsTab(QWidget):
                         "source": APP_NAME,
                     }
                 resp = http_req.post(url, json=payload, timeout=10)
-                # Can't easily show a message box from a thread, but it's fine for testing
-            except Exception:
-                pass
+                if resp.status_code >= 400:
+                    self._webhook_test_result.emit(False, f"Server answered HTTP {resp.status_code}:\n{resp.text[:300]}")
+                else:
+                    self._webhook_test_result.emit(True, f"Delivered (HTTP {resp.status_code}).")
+            except Exception as e:
+                self._webhook_test_result.emit(False, str(e))
 
+        # Previously reported "sent!" immediately, even when the URL was wrong
         threading.Thread(target=_post, daemon=True).start()
-        QMessageBox.information(self, "Test Webhook", "Test notification sent!")
+
+    def _show_webhook_test_result(self, ok: bool, detail: str):
+        if ok:
+            QMessageBox.information(self, "Test Webhook", f"Test notification sent. {detail}")
+        else:
+            QMessageBox.warning(self, "Test Webhook", f"Test notification failed.\n\n{detail}")
 
     # --- External updates ---
 

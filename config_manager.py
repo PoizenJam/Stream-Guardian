@@ -1,16 +1,24 @@
 """
-Configuration manager for Bitrate Guardian.
+Configuration manager for Stream Guardian.
 Handles persistent settings, preset save/load, and defaults.
+
+Saves are atomic (write temp file, fsync, os.replace) and the previous good
+file is kept as config.json.bak. A config that fails to parse is moved aside
+as config.corrupt-<timestamp>.json instead of being silently overwritten
+with defaults on the next save.
 """
 import json
 import os
 import copy
+import shutil
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 # === App identity — change these to rename/version the app ===
 APP_NAME = "Stream Guardian"           # Display name (window title, tray, webhooks)
 APP_INTERNAL_NAME = "StreamGuardian"   # Folder/exe name (no spaces, used for paths)
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 DEFAULT_CONFIG = {
     "srs": {
@@ -106,7 +114,9 @@ DEFAULT_CONFIG = {
         "always_on_top": False,
     },
     "override": {
-        "enabled": False,
+        # The override on/off state is intentionally not stored: auto-switch
+        # always starts ON so protection can't stay silently disabled after a
+        # restart. Old configs with "enabled" are ignored by _merge.
         "hotkey": "Ctrl+Shift+F12",
     },
 }
@@ -124,21 +134,76 @@ class ConfigManager:
         self.presets_dir = self.config_dir / "presets"
         self.presets_dir.mkdir(exist_ok=True)
         self.config_path = self.config_dir / "config.json"
+        self.backup_path = self.config_dir / "config.json.bak"
         self.config = copy.deepcopy(DEFAULT_CONFIG)
+        self._batch_depth = 0
+        self._dirty = False
+        # Human-readable note for the log when load had to recover
+        self.load_message = ""
         self.load()
 
     def load(self):
-        if self.config_path.exists():
-            try:
-                with open(self.config_path, "r") as f:
-                    saved = json.load(f)
-                self._merge(self.config, saved)
-            except (json.JSONDecodeError, IOError):
-                pass
+        if not self.config_path.exists():
+            return
+        saved = self._read_json(self.config_path)
+        if saved is not None:
+            self._merge(self.config, saved)
+            return
+
+        # Unreadable: keep the bad file for inspection and fall back to the backup
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        corrupt = self.config_dir / f"config.corrupt-{stamp}.json"
+        try:
+            shutil.move(str(self.config_path), str(corrupt))
+        except OSError:
+            pass
+        backup = self._read_json(self.backup_path) if self.backup_path.exists() else None
+        if backup is not None:
+            self._merge(self.config, backup)
+            self.load_message = f"config.json was unreadable; restored from backup (bad file kept as {corrupt.name})"
+        else:
+            self.load_message = f"config.json was unreadable and no backup exists; using defaults (bad file kept as {corrupt.name})"
+        self.save()
+
+    @staticmethod
+    def _read_json(path: Path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            return None
 
     def save(self):
-        with open(self.config_path, "w") as f:
-            json.dump(self.config, f, indent=2)
+        if self._batch_depth:
+            self._dirty = True
+            return
+        self._atomic_write(self.config_path, self.config, backup=True)
+
+    def _atomic_write(self, path: Path, data: dict, backup: bool = False):
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if backup and path.exists():
+            try:
+                shutil.copy2(path, self.backup_path)
+            except OSError:
+                pass
+        os.replace(tmp, path)
+
+    @contextmanager
+    def batch(self):
+        """Group many set() calls into one save (Apply Settings did ~50 writes)."""
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._dirty:
+                self._dirty = False
+                self.save()
 
     def get(self, *keys):
         val = self.config
@@ -161,16 +226,14 @@ class ConfigManager:
 
     # --- Presets ---
     def save_preset(self, name: str):
-        path = self.presets_dir / f"{name}.json"
-        with open(path, "w") as f:
-            json.dump(self.config, f, indent=2)
+        self._atomic_write(self.presets_dir / f"{name}.json", self.config)
 
     def load_preset(self, name: str) -> bool:
         path = self.presets_dir / f"{name}.json"
         if not path.exists():
             return False
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 preset = json.load(f)
             self.config = copy.deepcopy(DEFAULT_CONFIG)
             self._merge(self.config, preset)
@@ -192,7 +255,6 @@ class ConfigManager:
     def export_preset(self, name: str, dest_path: str):
         src = self.presets_dir / f"{name}.json"
         if src.exists():
-            import shutil
             shutil.copy2(src, dest_path)
 
     def import_preset(self, src_path: str, name: str = None):
@@ -200,7 +262,6 @@ class ConfigManager:
         if name is None:
             name = src.stem
         dest = self.presets_dir / f"{name}.json"
-        import shutil
         shutil.copy2(src, dest)
 
     @staticmethod

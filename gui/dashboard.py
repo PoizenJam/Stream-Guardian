@@ -283,7 +283,15 @@ class DashboardTab(QWidget):
         legend.setBrush(pg.mkBrush(c["bg_panel"] + "cc"))
 
         self._plot_widget = plot_widget
+        self.refresh_graph_options()
         return plot_widget
+
+    def refresh_graph_options(self):
+        """Apply the Settings > Graph checkboxes (they were saved but never used)."""
+        self.curve_average.setVisible(bool(self.cfg.get("graph", "show_average_line")))
+        show_thresh = bool(self.cfg.get("graph", "show_threshold_lines"))
+        self.line_low.setVisible(show_thresh)
+        self.line_disc.setVisible(show_thresh)
 
     def update_graph(self, graph_data: list, avg_kbps: float):
         """Update the rolling graph with new data."""
