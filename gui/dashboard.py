@@ -6,9 +6,9 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QGroupBox, QPushButton, QFrame, QSizePolicy, QSpinBox,
+    QGroupBox, QPushButton, QFrame, QSizePolicy, QSpinBox, QComboBox,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from gui.themes import COLORS_DARK, COLORS_LIGHT
@@ -101,10 +101,17 @@ class StatCard(QFrame):
 
 class DashboardTab(QWidget):
     INGEST_LABELS = {"oryx": "SRS", "mediamtx": "MediaMTX", "generic": "Ingest"}
+    STATE_TEXT = {"NORMAL": "Normal", "LOW_BITRATE": "Low", "DISCONNECTED": "Down"}
+
+    # A stream picked in the stream selector (stream id)
+    stream_selected = pyqtSignal(str)
 
     def __init__(self, config_manager, parent=None):
+        """config_manager: the StreamConfig of the stream on display. It also
+        answers global settings (graph, logging, theme)."""
         super().__init__(parent)
         self.cfg = config_manager
+        self._chips = {}  # stream id -> QLabel
         self._colors = COLORS_DARK if self.cfg.get("gui", "theme") == "dark" else COLORS_LIGHT
         self._build_ui()
 
@@ -121,6 +128,23 @@ class DashboardTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
+
+        # --- Stream selector + per-stream state chips (only with 2+ streams) ---
+        self.stream_row = QWidget()
+        sr = QHBoxLayout(self.stream_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        sr.addWidget(QLabel("Showing stream:"))
+        self.stream_combo = QComboBox()
+        self.stream_combo.setMinimumWidth(160)
+        self.stream_combo.currentIndexChanged.connect(self._on_stream_combo)
+        sr.addWidget(self.stream_combo)
+        sr.addSpacing(16)
+        self._chip_layout = QHBoxLayout()
+        self._chip_layout.setSpacing(6)
+        sr.addLayout(self._chip_layout)
+        sr.addStretch()
+        layout.addWidget(self.stream_row)
+        self.stream_row.setVisible(False)
 
         # --- Connection status bar ---
         status_row = QHBoxLayout()
@@ -428,6 +452,62 @@ class DashboardTab(QWidget):
         uptime = int(stats.get("uptime_s", 0))
         h, m, s = uptime // 3600, (uptime % 3600) // 60, uptime % 60
         self.lbl_uptime.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    # --- Streams ---
+
+    def set_streams(self, streams: list, selected_id: str):
+        """streams: [(id, name)] in display order."""
+        self.stream_combo.blockSignals(True)
+        self.stream_combo.clear()
+        for sid, name in streams:
+            self.stream_combo.addItem(name, sid)
+        idx = max(self.stream_combo.findData(selected_id), 0)
+        self.stream_combo.setCurrentIndex(idx)
+        self.stream_combo.blockSignals(False)
+        # Rebuild chips
+        for chip in self._chips.values():
+            self._chip_layout.removeWidget(chip)
+            chip.deleteLater()
+        self._chips = {}
+        for sid, name in streams:
+            chip = QLabel(f"{name}: …")
+            chip.setStyleSheet("padding: 2px 8px; border-radius: 8px; border: 1px solid palette(mid);")
+            self._chip_layout.addWidget(chip)
+            self._chips[sid] = chip
+        self.stream_row.setVisible(len(streams) > 1)
+
+    def update_stream_chip(self, sid: str, name: str, state: str, test: bool):
+        chip = self._chips.get(sid)
+        if not chip:
+            return
+        colors = {"NORMAL": self._colors["success"], "LOW_BITRATE": self._colors["warning"],
+                  "DISCONNECTED": self._colors["danger"]}
+        text = f"{name}: {self.STATE_TEXT.get(state, state)}" + (" (test)" if test else "")
+        if chip.text() != text:
+            chip.setText(text)
+            chip.setStyleSheet(
+                f"padding: 2px 8px; border-radius: 8px; color: white; "
+                f"background-color: {colors.get(state, '#777')};"
+            )
+
+    def _on_stream_combo(self, index: int):
+        sid = self.stream_combo.itemData(index)
+        if sid:
+            self.stream_selected.emit(sid)
+
+    def set_view(self, view):
+        """Show another stream: thresholds, ingest label and graph follow it."""
+        self.cfg = view
+        self.refresh_ingest_label()
+        self.line_low.setValue(self.cfg.get("thresholds", "low_bitrate_kbps"))
+        self.line_disc.setValue(self.cfg.get("thresholds", "disconnect_kbps"))
+        self.curve_bitrate.setData([], [])
+        self.curve_average.setData([], [])
+        idx = self.stream_combo.findData(getattr(view, "id", None))
+        if idx >= 0 and idx != self.stream_combo.currentIndex():
+            self.stream_combo.blockSignals(True)
+            self.stream_combo.setCurrentIndex(idx)
+            self.stream_combo.blockSignals(False)
 
     def set_test_mode(self, state_name: str):
         """Enable End Test only while a simulation runs."""

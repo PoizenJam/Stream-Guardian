@@ -41,6 +41,20 @@ class FakeOBS:
         self.vis[(scene, source)] = visible
         return True
 
+    events = None
+    chapters = None
+    recording = False
+
+    def broadcast_event(self, data):
+        self.events = (self.events or []) + [data]
+        return True
+
+    def add_record_chapter(self, name):
+        if not self.recording:
+            return False, ""
+        self.chapters = (self.chapters or []) + [name]
+        return True, ""
+
 
 class QuietEngine(BitrateEngine):
     """Records webhooks instead of sending them."""
@@ -335,4 +349,119 @@ class TestCsvLog(EngineTestBase):
         name = [n for n in os.listdir(self.tmp.name) if n.startswith("bitrate_")][0]
         with open(os.path.join(self.tmp.name, name), newline="", encoding="utf-8") as f:
             rows = list(csv.reader(f))
-        self.assertTrue(rows[-1][4].startswith("SESSION SUMMARY:"))
+        self.assertTrue(rows[-1][4].startswith("SESSION SUMMARY (Main):"))
+
+
+class TestMultiStream(unittest.TestCase):
+    """Two engines sharing one SceneArbiter, as the main window runs them."""
+
+    def setUp(self):
+        from scene_arbiter import SceneArbiter
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = ConfigManager(config_dir=self.tmp.name)
+        first = self.cfg.streams()[0]["id"]
+        second = self.cfg.add_stream("Cam 2")
+        self.a_cfg = self.cfg.stream_view(first)
+        self.b_cfg = self.cfg.stream_view(second)
+        for view, low, brb in ((self.a_cfg, "Low A", "BRB A"), (self.b_cfg, "Low B", "BRB B")):
+            with self.cfg.batch():
+                view.set("thresholds", "grace_period_s", 0)
+                view.set("thresholds", "recovery_delay_s", 0)
+                view.set("thresholds", "cooldown_s", 0)
+                view.set("scenes", "low_bitrate_scene", low)
+                view.set("scenes", "disconnect_scene", brb)
+        self.obs = FakeOBS()
+        self.arb = SceneArbiter(self.obs)
+        self.log = []
+        self.arb.log_entry.connect(self.log.append)
+        self.a = QuietEngine(self.a_cfg, self.obs, arbiter=self.arb)
+        self.b = QuietEngine(self.b_cfg, self.obs, arbiter=self.arb)
+        for e in (self.a, self.b):
+            e.prefix_logs = True
+            e.log_entry.connect(self.log.append)
+        self.t = 1000.0
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def step(self, engine, avg, online=True):
+        self.t += 1
+        engine.set_stream_online(online)
+        engine._evaluate_thresholds(avg, self.t)
+        engine._reconcile(self.t)
+
+    def test_streams_have_separate_settings(self):
+        self.assertEqual(self.a_cfg.get("scenes", "low_bitrate_scene"), "Low A")
+        self.assertEqual(self.b_cfg.get("scenes", "low_bitrate_scene"), "Low B")
+        self.assertEqual(self.a_cfg.get("scenes", "whitelist"), self.b_cfg.get("scenes", "whitelist"))
+
+    def test_more_severe_scene_wins_and_original_restored_once_all_clear(self):
+        self.step(self.a, 500)                    # A low -> "Low A"
+        self.assertEqual(self.obs.current_scene, "Low A")
+        self.step(self.b, 0, online=False)        # B disconnect outranks A's low
+        self.assertEqual(self.obs.current_scene, "BRB B")
+        self.step(self.b, 3000)                   # B recovers: A still low
+        self.assertEqual(self.obs.current_scene, "Low A")
+        self.step(self.a, 3000)                   # all clear -> back to Main
+        self.assertEqual(self.obs.current_scene, "Main")
+
+    def test_first_stream_recovering_does_not_strand_obs(self):
+        self.step(self.a, 0, online=False)        # A: BRB A
+        self.step(self.b, 0, online=False)        # B: same severity, A asked first
+        self.assertEqual(self.obs.current_scene, "BRB A")
+        self.step(self.a, 3000)                   # A clears: show B's request
+        self.assertEqual(self.obs.current_scene, "BRB B")
+        self.step(self.b, 3000)
+        self.assertEqual(self.obs.current_scene, "Main")
+
+    def test_manual_change_wins_on_release_but_new_disconnect_still_switches(self):
+        self.step(self.a, 500)
+        self.obs.current_scene = "Chatting"       # streamer picks a scene
+        self.step(self.b, 0, online=False)        # a disconnect must still show
+        self.assertEqual(self.obs.current_scene, "BRB B")
+        self.step(self.b, 3000)
+        self.step(self.a, 3000)
+        self.assertEqual(self.obs.current_scene, "Chatting")  # their choice, not Main
+
+    def test_log_lines_are_prefixed_with_stream_name(self):
+        self.step(self.b, 500)
+        self.assertTrue(any(m.startswith("[Cam 2] TRANSITION") for m in self.log))
+
+
+class TestPerSceneTargetsAndIntegrations(EngineTestBase):
+    def test_scene_override_used_for_matching_scene(self):
+        self.cfg.set("scenes", "scene_overrides", [
+            {"when_on": "Gaming", "low": "Gaming Low", "disconnect": ""},
+        ])
+        self.obs.current_scene = "Gaming"
+        self.feed(500, 4)
+        self.assertEqual(self.obs.current_scene, "Gaming Low")
+        self.feed(0, 1, online=False)            # blank disconnect -> normal target
+        self.assertEqual(self.obs.current_scene, "BRB")
+        self.feed(3000, 15)
+        self.assertEqual(self.obs.current_scene, "Gaming")
+
+    def test_custom_event_and_chapter(self):
+        self.cfg.set("integrations", "record_chapters", True)
+        self.obs.recording = True
+        self.feed(500, 4)
+        ev = self.obs.events[-1]
+        self.assertEqual((ev["event"], ev["state"], ev["previous"], ev["stream"], ev["test"]),
+                         ("state_changed", "LOW_BITRATE", "NORMAL", "Main", False))
+        self.assertEqual(self.obs.chapters, ["Main: LOW_BITRATE"])
+        self.eng.simulate("disconnect")          # tests: event yes, chapter no
+        self.assertTrue(self.obs.events[-1]["test"])
+        self.assertEqual(len(self.obs.chapters), 1)
+
+    def test_custom_event_can_be_turned_off(self):
+        self.cfg.set("integrations", "obs_custom_event", False)
+        self.feed(500, 4)
+        self.assertIsNone(self.obs.events)
+
+    def test_stream_placeholder_in_webhook(self):
+        with self.cfg.batch():
+            self.cfg.set("notifications", "webhook_enabled", True)
+            self.cfg.set("notifications", "webhook_url", "https://example.invalid/hook")
+            self.cfg.set("notifications", "webhook_low_bitrate_msg", "{stream} low at {bitrate}")
+        self.feed(500, 4)
+        self.assertEqual(self.eng.webhooks, ["Main low at 500"])

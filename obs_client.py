@@ -413,6 +413,37 @@ class OBSClient(QThread):
         found = self._find_item(scene_name, source_name)
         return None if found is None else bool(found[1])
 
+    def broadcast_event(self, data: dict) -> bool:
+        """Send an obs-websocket CustomEvent to every connected client (for
+        Streamer.bot, Advanced Scene Switcher, browser sources...)."""
+        if not self._connected:
+            return False
+        try:
+            self._req("broadcast_custom_event", data)
+            return True
+        except Exception as e:
+            self.error.emit(f"OBS custom event failed: {e}")
+            return False
+
+    def add_record_chapter(self, name: str):
+        """Add a chapter marker to the current recording.
+        Returns (ok, reason). Not recording is not an error (reason "").
+        Uses the generic send() because create_record_chapter() only exists in
+        newer obsws-python releases."""
+        if not self._connected:
+            return False, "not connected to OBS"
+        try:
+            status = self._req("get_record_status")
+            if not getattr(status, "output_active", False):
+                return False, ""
+            self._req("send", "CreateRecordChapter", {"chapterName": name})
+            return True, ""
+        except OBSSDKRequestError as e:
+            # e.g. older OBS (< 30.2) or a non-Hybrid-MP4 recording format
+            return False, f"{e} (needs OBS 30.2+ recording in Hybrid MP4)"
+        except Exception as e:
+            return False, str(e)
+
     def refresh(self):
         """Force refresh scene and transition lists."""
         if self._connected:

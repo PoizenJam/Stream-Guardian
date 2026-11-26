@@ -8,10 +8,15 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QListWidget, QListWidgetItem, QScrollArea,
     QFrame, QFileDialog, QAbstractItemView, QMessageBox, QSlider,
     QStackedWidget, QRadioButton, QButtonGroup, QTextEdit,
+    QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView, QApplication,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from config_manager import APP_NAME, APP_INTERNAL_NAME
+import autostart
+
+# Groups whose settings belong to the stream picked in the Streams selector
+STREAM_TAG = " (this stream)"
 
 # Audio file filter
 AUDIO_FILTER = "Audio Files (*.wav *.mp3 *.ogg *.flac *.m4a);;All Files (*)"
@@ -128,9 +133,13 @@ class SettingsTab(QWidget):
     _webhook_test_result = pyqtSignal(bool, str)
 
     def __init__(self, config_manager, parent=None):
+        """config_manager: the ConfigManager. Per-stream fields read and write
+        self.view, the StreamConfig of the stream picked at the top."""
         super().__init__(parent)
         self.cfg = config_manager
+        self.view = self.cfg.stream_view(self.cfg.streams()[0]["id"])
         self._build_ui()
+        self._refresh_stream_combo()
         self._load_from_config()
         self._webhook_test_result.connect(self._show_webhook_test_result)
 
@@ -143,8 +152,39 @@ class SettingsTab(QWidget):
         main_layout = QVBoxLayout(container)
         main_layout.setSpacing(16)
 
+        # === Streams ===
+        streams_group = QGroupBox("Streams")
+        sg = QVBoxLayout()
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Editing stream:"))
+        self.stream_combo = QComboBox()
+        self.stream_combo.setMinimumWidth(180)
+        self.stream_combo.currentIndexChanged.connect(self._on_stream_combo)
+        row.addWidget(self.stream_combo, stretch=1)
+        for text, slot, tip in (
+            ("Add...", self._add_stream, "Add another stream to monitor (starts as a copy of this one)"),
+            ("Rename...", self._rename_stream, "Rename this stream"),
+            ("Remove", self._remove_stream, "Stop monitoring this stream"),
+        ):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        self.btn_remove_stream = b
+        sg.addLayout(row)
+        note = QLabel(
+            "Groups marked \"(this stream)\" belong to the stream picked here; every stream has "
+            "its own ingest settings, thresholds and protection actions. Everything else is shared. "
+            "Switching streams keeps your edits; click Apply Settings to put them into effect."
+        )
+        note.setProperty("dim", True)
+        note.setWordWrap(True)
+        sg.addWidget(note)
+        streams_group.setLayout(sg)
+        main_layout.addWidget(streams_group)
+
         # === Ingest Server Connection ===
-        srs_group = QGroupBox("Ingest Server API Connection")
+        srs_group = QGroupBox("Ingest Server API Connection" + STREAM_TAG)
         srs_layout = QGridLayout()
 
         # -- Backend selector at top --
@@ -342,7 +382,7 @@ class SettingsTab(QWidget):
         main_layout.addWidget(obs_group)
 
         # === Thresholds ===
-        thresh_group = QGroupBox("Bitrate Thresholds")
+        thresh_group = QGroupBox("Bitrate Thresholds" + STREAM_TAG)
         thresh_layout = QGridLayout()
 
         self.thresh_low = QSpinBox()
@@ -401,7 +441,7 @@ class SettingsTab(QWidget):
         # Adaptive encoders (Moblin SRT, x264 capped CRF, etc.) legitimately
         # drop their bitrate on dark or static scenes — that's not a network
         # problem. These options help Stream Guardian tell the difference.
-        fp_group = QGroupBox("False Positive Mitigation (Adaptive Bitrate)")
+        fp_group = QGroupBox("False Positive Mitigation (Adaptive Bitrate)" + STREAM_TAG)
         fp_layout = QGridLayout()
 
         self.fp_trust_offline = QCheckBox(
@@ -466,7 +506,7 @@ class SettingsTab(QWidget):
         main_layout.addWidget(fp_group)
 
         # === SRT Link Quality (MediaMTX) ===
-        link_group = QGroupBox("SRT Link Quality (MediaMTX backend, SRT publishers)")
+        link_group = QGroupBox("SRT Link Quality (MediaMTX backend, SRT publishers)" + STREAM_TAG)
         link_layout = QGridLayout()
 
         self.link_enabled = QCheckBox("Read SRT link stats (packet loss, round-trip time)")
@@ -513,7 +553,7 @@ class SettingsTab(QWidget):
         main_layout.addWidget(link_group)
 
         # === Protection Actions (Low Bitrate) ===
-        low_group = QGroupBox("Low Bitrate Protection")
+        low_group = QGroupBox("Low Bitrate Protection" + STREAM_TAG)
         low_layout = QVBoxLayout()
         self.protection_low = ProtectionModeWidget("Low Bitrate", "low_bitrate")
         self.protection_low.btn_fetch_sources.clicked.connect(
@@ -524,7 +564,7 @@ class SettingsTab(QWidget):
         main_layout.addWidget(low_group)
 
         # === Protection Actions (Disconnect) ===
-        disc_group = QGroupBox("Disconnect Protection")
+        disc_group = QGroupBox("Disconnect Protection" + STREAM_TAG)
         disc_layout = QVBoxLayout()
         self.protection_disc = ProtectionModeWidget("Disconnect", "disconnect")
         self.protection_disc.btn_fetch_sources.clicked.connect(
@@ -533,6 +573,36 @@ class SettingsTab(QWidget):
         disc_layout.addWidget(self.protection_disc)
         disc_group.setLayout(disc_layout)
         main_layout.addWidget(disc_group)
+
+        # === Per-scene targets ===
+        ov_group = QGroupBox("Per-Scene Targets" + STREAM_TAG)
+        ov_layout = QVBoxLayout()
+        ov_help = QLabel(
+            "Use a different protection scene depending on the scene you're on. When the stream "
+            "drops while you're on a scene in the first column, Stream Guardian switches to that "
+            "row's scene instead of the normal Low Bitrate / Disconnect target. Leave a target "
+            "blank to use the normal one. Only applies to the \"Switch Scene\" action."
+        )
+        ov_help.setProperty("dim", True)
+        ov_help.setWordWrap(True)
+        ov_layout.addWidget(ov_help)
+        self.overrides_table = QTableWidget(0, 3)
+        self.overrides_table.setHorizontalHeaderLabels(["When on scene", "Low bitrate scene", "Disconnect scene"])
+        self.overrides_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.overrides_table.verticalHeader().setVisible(False)
+        self.overrides_table.setMaximumHeight(140)
+        ov_layout.addWidget(self.overrides_table)
+        ov_btns = QHBoxLayout()
+        btn_ov_add = QPushButton("Add Row")
+        btn_ov_add.clicked.connect(lambda: self._add_override_row({}))
+        btn_ov_rem = QPushButton("Remove Selected")
+        btn_ov_rem.clicked.connect(self._remove_override_rows)
+        ov_btns.addStretch()
+        ov_btns.addWidget(btn_ov_add)
+        ov_btns.addWidget(btn_ov_rem)
+        ov_layout.addLayout(ov_btns)
+        ov_group.setLayout(ov_layout)
+        main_layout.addWidget(ov_group)
 
         # === Transitions ===
         trans_group = QGroupBox("OBS Transitions")
@@ -654,7 +724,7 @@ class SettingsTab(QWidget):
         url_row.addWidget(self.notif_webhook_url, stretch=1)
         webhook_layout.addLayout(url_row)
 
-        webhook_layout.addWidget(QLabel("Message Templates (use {bitrate} placeholder):"))
+        webhook_layout.addWidget(QLabel("Message Templates (placeholders: {bitrate}, {stream}):"))
 
         self.webhook_low_msg = QLineEdit()
         self.webhook_low_msg.setPlaceholderText(
@@ -760,6 +830,74 @@ class SettingsTab(QWidget):
         gui_group.setLayout(gui_layout)
         main_layout.addWidget(gui_group)
 
+        # === Startup & Updates ===
+        start_group = QGroupBox("Startup & Updates")
+        st = QVBoxLayout()
+        self.start_with_windows = QCheckBox("Start with Windows (minimized to the system tray)")
+        self.start_with_windows.setToolTip(
+            "Adds Stream Guardian to your Windows sign-in startup list (per user, no admin\n"
+            "needed). It starts hidden in the tray; click the tray icon to open it."
+        )
+        if not autostart.supported():
+            self.start_with_windows.setEnabled(False)
+            self.start_with_windows.setToolTip("Only available on Windows")
+        self.start_minimized = QCheckBox("Always start minimized to the system tray")
+        self.check_updates = QCheckBox("Check for a new version at launch (notice only, nothing is downloaded)")
+        for w in (self.start_with_windows, self.start_minimized, self.check_updates):
+            st.addWidget(w)
+        start_group.setLayout(st)
+        main_layout.addWidget(start_group)
+
+        # === Integrations ===
+        integ_group = QGroupBox("Integrations")
+        ig = QVBoxLayout()
+        self.obs_custom_event = QCheckBox("Send an OBS custom event on every state change")
+        self.obs_custom_event.setToolTip(
+            "Broadcasts an obs-websocket CustomEvent so tools like Streamer.bot,\n"
+            "Advanced Scene Switcher or a browser source can react. Payload:\n"
+            '{"source": "StreamGuardian", "event": "state_changed", "stream": ...,\n'
+            ' "state": ..., "previous": ..., "test": true/false, "avg_kbps": ...}'
+        )
+        self.record_chapters = QCheckBox("Add a chapter marker to the OBS recording on each drop and recovery")
+        self.record_chapters.setToolTip(
+            "Needs OBS 30.2 or newer, recording in Hybrid MP4 format.\n"
+            "Only while recording; tests are not marked."
+        )
+        ig.addWidget(self.obs_custom_event)
+        ig.addWidget(self.record_chapters)
+        integ_group.setLayout(ig)
+        main_layout.addWidget(integ_group)
+
+        # === Overlay ===
+        ovl_group = QGroupBox("Stream Overlay (OBS Browser Source)")
+        ol = QGridLayout()
+        self.overlay_enabled = QCheckBox("Serve a live status overlay")
+        self.overlay_port = QSpinBox()
+        self.overlay_port.setRange(1024, 65535)
+        self.overlay_lan = QCheckBox("Allow other computers on my network (for OBS on another PC)")
+        self.overlay_url = QLineEdit()
+        self.overlay_url.setReadOnly(True)
+        btn_copy = QPushButton("Copy URL")
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(self.overlay_url.text()))
+        self.overlay_port.valueChanged.connect(self._update_overlay_url)
+        ol.addWidget(self.overlay_enabled, 0, 0, 1, 3)
+        ol.addWidget(QLabel("Port:"), 1, 0)
+        ol.addWidget(self.overlay_port, 1, 1)
+        ol.addWidget(self.overlay_lan, 2, 0, 1, 3)
+        ol.addWidget(QLabel("Browser Source URL:"), 3, 0)
+        ol.addWidget(self.overlay_url, 3, 1)
+        ol.addWidget(btn_copy, 3, 2)
+        ovl_help = QLabel(
+            "Add a Browser Source in OBS with this URL (width 400, height 80). Options: "
+            "?stream=Name picks a stream, &hide_when_normal=1 only shows the badge during "
+            "trouble, &show_bitrate=0 hides the kbps, &scale=1.5 resizes it."
+        )
+        ovl_help.setProperty("dim", True)
+        ovl_help.setWordWrap(True)
+        ol.addWidget(ovl_help, 4, 0, 1, 3)
+        ovl_group.setLayout(ol)
+        main_layout.addWidget(ovl_group)
+
         # === Apply / Reset ===
         btn_row = QHBoxLayout()
         btn_apply = QPushButton("Apply Settings")
@@ -813,7 +951,7 @@ class SettingsTab(QWidget):
     # --- Load / Apply ---
 
     def _load_from_config(self):
-        c = self.cfg
+        c = self.view
 
         self.srs_backend.setCurrentText(c.get("srs", "backend"))
         self.srs_host.setText(c.get("srs", "host"))
@@ -888,8 +1026,25 @@ class SettingsTab(QWidget):
         self.gui_minimize_tray.setChecked(c.get("gui", "minimize_to_tray"))
         self.gui_always_top.setChecked(c.get("gui", "always_on_top"))
 
+        # Per-scene targets (this stream)
+        self.overrides_table.setRowCount(0)
+        for rule in c.get("scenes", "scene_overrides") or []:
+            if isinstance(rule, dict):
+                self._add_override_row(rule)
+
+        # Startup, integrations, overlay (global)
+        self.start_with_windows.setChecked(bool(c.get("startup", "start_with_windows")))
+        self.start_minimized.setChecked(bool(c.get("gui", "start_minimized")))
+        self.check_updates.setChecked(bool(c.get("startup", "check_updates")))
+        self.obs_custom_event.setChecked(bool(c.get("integrations", "obs_custom_event")))
+        self.record_chapters.setChecked(bool(c.get("integrations", "record_chapters")))
+        self.overlay_enabled.setChecked(bool(c.get("overlay", "enabled")))
+        self.overlay_port.setValue(int(c.get("overlay", "port")))
+        self.overlay_lan.setChecked(bool(c.get("overlay", "allow_lan")))
+        self._update_overlay_url()
+
     def _load_protection(self, widget: ProtectionModeWidget, key: str):
-        c = self.cfg
+        c = self.view
         mode = c.get("scenes", f"{key}_mode")
         if mode == "source":
             widget.rb_source.setChecked(True)
@@ -911,7 +1066,7 @@ class SettingsTab(QWidget):
             self.settings_changed.emit()
 
     def _apply_fields(self):
-        c = self.cfg
+        c = self.view
 
         c.set("srs", "backend", self.srs_backend.currentText())
         c.set("srs", "host", self.srs_host.text() or "localhost")
@@ -982,8 +1137,25 @@ class SettingsTab(QWidget):
         c.set("gui", "minimize_to_tray", self.gui_minimize_tray.isChecked())
         c.set("gui", "always_on_top", self.gui_always_top.isChecked())
 
+        rules = []
+        for r in range(self.overrides_table.rowCount()):
+            cells = [(self.overrides_table.item(r, col).text().strip()
+                      if self.overrides_table.item(r, col) else "") for col in range(3)]
+            if cells[0]:
+                rules.append({"when_on": cells[0], "low": cells[1], "disconnect": cells[2]})
+        c.set("scenes", "scene_overrides", rules)
+
+        c.set("startup", "start_with_windows", self.start_with_windows.isChecked())
+        c.set("gui", "start_minimized", self.start_minimized.isChecked())
+        c.set("startup", "check_updates", self.check_updates.isChecked())
+        c.set("integrations", "obs_custom_event", self.obs_custom_event.isChecked())
+        c.set("integrations", "record_chapters", self.record_chapters.isChecked())
+        c.set("overlay", "enabled", self.overlay_enabled.isChecked())
+        c.set("overlay", "port", self.overlay_port.value())
+        c.set("overlay", "allow_lan", self.overlay_lan.isChecked())
+
     def _apply_protection(self, widget: ProtectionModeWidget, key: str):
-        c = self.cfg
+        c = self.view
         mode = "source" if widget.rb_source.isChecked() else "scene"
         c.set("scenes", f"{key}_mode", mode)
         c.set("scenes", f"{key}_scene", widget.scene_combo.currentText())
@@ -999,8 +1171,98 @@ class SettingsTab(QWidget):
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.cfg.reset()
-            self._load_from_config()
+            self.reload_streams()
             self.settings_changed.emit()
+
+    # --- Streams ---
+
+    def _refresh_stream_combo(self):
+        self.stream_combo.blockSignals(True)
+        self.stream_combo.clear()
+        for st in self.cfg.streams():
+            self.stream_combo.addItem(st["name"], st["id"])
+        idx = self.stream_combo.findData(self.view.id)
+        if idx < 0:
+            idx = 0
+            self.view = self.cfg.stream_view(self.stream_combo.itemData(0))
+        self.stream_combo.setCurrentIndex(idx)
+        self.stream_combo.blockSignals(False)
+        self.btn_remove_stream.setEnabled(len(self.cfg.streams()) > 1)
+
+    def reload_streams(self):
+        """After a preset load or reset: streams may have changed entirely."""
+        self._refresh_stream_combo()
+        self._load_from_config()
+
+    def _on_stream_combo(self, index: int):
+        sid = self.stream_combo.itemData(index)
+        if not sid or sid == self.view.id:
+            return
+        # Keep the edits made to the stream we're leaving (saved, not yet applied)
+        with self.cfg.batch():
+            self._apply_fields()
+        self.view = self.cfg.stream_view(sid)
+        self._load_from_config()
+
+    def _add_stream(self):
+        name, ok = QInputDialog.getText(
+            self, "Add Stream",
+            "Name for the new stream (for example \"Side Cam\").\n"
+            "It starts as a copy of the stream you're editing; change its\n"
+            "Stream Name / path and protection actions, then Apply.",
+        )
+        name = name.strip()
+        if not ok or not name:
+            return
+        with self.cfg.batch():
+            self._apply_fields()
+        sid = self.cfg.add_stream(name, copy_from=self.view.id)
+        self.view = self.cfg.stream_view(sid)
+        self._refresh_stream_combo()
+        self._load_from_config()
+        self.settings_changed.emit()
+
+    def _rename_stream(self):
+        name, ok = QInputDialog.getText(self, "Rename Stream", "New name:", text=self.view.name)
+        name = name.strip()
+        if not ok or not name or name == self.view.name:
+            return
+        self.cfg.rename_stream(self.view.id, name)
+        self._refresh_stream_combo()
+        self.settings_changed.emit()
+
+    def _remove_stream(self):
+        if len(self.cfg.streams()) <= 1:
+            return
+        reply = QMessageBox.question(
+            self, "Remove Stream",
+            f"Stop monitoring '{self.view.name}' and delete its settings?\n"
+            "Any protection it is showing in OBS right now is undone first.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.cfg.remove_stream(self.view.id)
+        self.view = self.cfg.stream_view(self.cfg.streams()[0]["id"])
+        self._refresh_stream_combo()
+        self._load_from_config()
+        self.settings_changed.emit()
+
+    # --- Per-scene targets ---
+
+    def _add_override_row(self, rule: dict):
+        r = self.overrides_table.rowCount()
+        self.overrides_table.insertRow(r)
+        for col, key in enumerate(("when_on", "low", "disconnect")):
+            self.overrides_table.setItem(r, col, QTableWidgetItem(str(rule.get(key, ""))))
+
+    def _remove_override_rows(self):
+        rows = sorted({i.row() for i in self.overrides_table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.overrides_table.removeRow(r)
+
+    def _update_overlay_url(self):
+        self.overlay_url.setText(f"http://127.0.0.1:{self.overlay_port.value()}/")
 
     # --- Helpers ---
 

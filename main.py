@@ -44,7 +44,14 @@ def main():
     window = MainWindow()
     instance.activation_requested.connect(window._show_from_tray)
     app.aboutToQuit.connect(instance.release)
-    window.show()
+
+    # --minimized comes from the Start with Windows entry. Only hide the window
+    # if there is a tray icon to bring it back from.
+    start_hidden = ("--minimized" in sys.argv[1:] or window.cfg.get("gui", "start_minimized"))
+    if start_hidden and window.tray_available:
+        window.tab_log.append("Started minimized to the system tray")
+    else:
+        window.show()
 
     return app.exec()
 

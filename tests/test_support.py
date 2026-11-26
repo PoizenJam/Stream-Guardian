@@ -230,3 +230,77 @@ class TestIngestParsing(unittest.TestCase):
     def test_mediamtx_old_server_fields(self):
         found, _, _ = self.poller._poll_mediamtx({"name": "cam", "ready": True, "bytesReceived": 10})
         self.assertTrue(found)
+
+
+class TestConfigV2(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_v1_config_migrates_to_one_stream(self):
+        v1 = {"srs": {"backend": "mediamtx", "stream_name": "PixieMainCam", "port": 9997},
+              "thresholds": {"low_bitrate_kbps": 1500},
+              "scenes": {"disconnect_scene": "BRB", "whitelist": ["Starting Soon"],
+                         "transition_name": "Stinger"},
+              "obs": {"port": 4456}}
+        with open(os.path.join(self.dir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(v1, f)
+        cfg = ConfigManager(config_dir=self.dir)
+        self.assertIn("upgraded", cfg.load_message)
+        self.assertEqual(read_json(os.path.join(self.dir, "config.v1-backup.json"))["obs"]["port"], 4456)
+        streams = cfg.streams()
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0]["name"], "Main")
+        self.assertEqual(streams[0]["srs"]["stream_name"], "PixieMainCam")
+        self.assertEqual(streams[0]["srs"]["poll_interval_ms"], 1000)  # default filled in
+        self.assertEqual(streams[0]["thresholds"]["low_bitrate_kbps"], 1500)
+        self.assertEqual(streams[0]["scenes"]["disconnect_scene"], "BRB")
+        self.assertEqual(cfg.get("scenes", "whitelist"), ["Starting Soon"])  # stays global
+        self.assertEqual(cfg.get("scenes", "transition_name"), "Stinger")
+        self.assertEqual(cfg.get("obs", "port"), 4456)
+        on_disk = read_json(cfg.config_path)
+        self.assertEqual(on_disk["config_version"], 2)
+        self.assertNotIn("srs", on_disk)
+
+    def test_v1_preset_loads(self):
+        cfg = ConfigManager(config_dir=self.dir)
+        with open(os.path.join(self.dir, "presets", "Old.json"), "w", encoding="utf-8") as f:
+            json.dump({"srs": {"host": "mainframe"}, "scenes": {"low_bitrate_scene": "Potato"}}, f)
+        self.assertTrue(cfg.load_preset("Old"))
+        self.assertEqual(cfg.get("srs", "host"), "mainframe")
+        self.assertEqual(cfg.stream_view(cfg.streams()[0]["id"]).get("scenes", "low_bitrate_scene"), "Potato")
+
+    def test_add_rename_remove_streams(self):
+        cfg = ConfigManager(config_dir=self.dir)
+        main = cfg.streams()[0]["id"]
+        cfg.stream_view(main).set("srs", "host", "studio")
+        b = cfg.add_stream("Cam 2", copy_from=main)
+        self.assertEqual(cfg.stream_view(b).get("srs", "host"), "studio")  # copied
+        c = cfg.add_stream("Cam 2")                                        # duplicate name
+        self.assertEqual(cfg.stream_view(c).name, "Cam 2 2")
+        cfg.rename_stream(b, "Side")
+        self.assertEqual([s["name"] for s in cfg.streams()], ["Main", "Side", "Cam 2 2"])
+        self.assertTrue(cfg.remove_stream(c))
+        self.assertTrue(cfg.remove_stream(b))
+        self.assertFalse(cfg.remove_stream(main))  # last one stays
+        reloaded = ConfigManager(config_dir=self.dir)
+        self.assertEqual([s["name"] for s in reloaded.streams()], ["Main"])
+
+
+class TestStreamViewAfterDelete(unittest.TestCase):
+    def test_deleted_stream_view_keeps_its_own_settings(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            cfg = ConfigManager(config_dir=tmp.name)
+            b = cfg.add_stream("Side")
+            view = cfg.stream_view(b)
+            view.set("scenes", "disconnect_scene", "Side BRB")
+            self.assertEqual(view.name, "Side")
+            cfg.remove_stream(b)
+            self.assertEqual(view.name, "Side")
+            self.assertEqual(view.get("scenes", "disconnect_scene"), "Side BRB")
+        finally:
+            tmp.cleanup()

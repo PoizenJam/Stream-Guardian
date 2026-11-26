@@ -1,6 +1,7 @@
 # Build StreamGuardian Windows EXE on release tag push
 # Creates a GitHub Release with:
-# - StreamGuardian-<version>-Windows.zip (PyInstaller EXE)
+# - StreamGuardian-<version>-Setup.exe (Inno Setup installer, per-user)
+# - StreamGuardian-<version>-Windows.zip (PyInstaller EXE, portable)
 # - StreamGuardian-<version>-Source.zip (Python source distribution)
 
 name: Build Release
@@ -48,11 +49,22 @@ jobs:
           $version = "${{ github.ref_name }}" -replace '^v', ''
           Compress-Archive -Path "dist/*" -DestinationPath "StreamGuardian-${version}-Windows.zip"
 
+      - name: Build installer (Inno Setup)
+        # The portable zip is the primary download; don't fail the release if
+        # the installer step has a problem.
+        continue-on-error: true
+        run: |
+          choco install innosetup --no-progress -y
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer.iss
+
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: StreamGuardian-*-Windows.zip
+          path: |
+            StreamGuardian-*-Windows.zip
+            StreamGuardian-*-Setup.exe
 
   build-source:
     runs-on: ubuntu-latest
@@ -63,14 +75,12 @@ jobs:
       - name: Create source zip
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # *.py picks up every top-level module, so new files can't be missed
           zip -r "StreamGuardian-${VERSION}-Source.zip" \
-            main.py \
-            config_manager.py \
-            ingest_client.py \
-            obs_client.py \
-            bitrate_engine.py \
-            single_instance.py \
+            *.py \
             gui/ \
+            tests/ \
+            installer.iss \
             requirements.txt \
             build.spec \
             build.bat \
@@ -100,5 +110,6 @@ jobs:
           draft: true
           generate_release_notes: true
           files: |
+            StreamGuardian-*-Setup.exe
             StreamGuardian-*-Windows.zip
             StreamGuardian-*-Source.zip

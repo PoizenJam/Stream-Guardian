@@ -25,6 +25,7 @@ import requests as http_requests
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from config_manager import APP_NAME, APP_INTERNAL_NAME
+from scene_arbiter import SceneArbiter, SEVERITY
 
 # Simulated outages end on their own after this long, in case End Test is forgotten
 TEST_MODE_MAX_S = 120
@@ -58,10 +59,20 @@ class BitrateEngine(QObject):
     play_audio = pyqtSignal(str, int)  # file path, volume 0-100 (played on the GUI thread)
     test_mode_changed = pyqtSignal(str)  # "" when no test, else "LOW_BITRATE" / "DISCONNECTED"
 
-    def __init__(self, config_manager, obs_client, parent=None):
+    def __init__(self, config_manager, obs_client, arbiter: SceneArbiter = None, parent=None):
+        """config_manager: a StreamConfig (one stream's view) or, for a
+        single stream, the ConfigManager itself. arbiter: the SceneArbiter
+        shared by all streams; a private one is made if not given."""
         super().__init__(parent)
         self.cfg = config_manager
         self.obs = obs_client
+        self.stream_id = getattr(config_manager, "id", "main")
+        # Set True by the main window when more than one stream is monitored
+        self.prefix_logs = False
+        if arbiter is None:
+            arbiter = SceneArbiter(obs_client, parent=self)
+            arbiter.log_entry.connect(self._log)
+        self.arbiter = arbiter
 
         # Rolling data
         self._history = deque()  # (timestamp, bitrate_kbps)
@@ -84,12 +95,7 @@ class BitrateEngine(QObject):
         self._recovery_start = 0.0
         self._in_recovery = False
 
-        # Scene restore tracking. _saved_scene is the scene the streamer was on
-        # before the first auto-switch; _protection_scene is the scene we
-        # switched to. Recovery only switches back if OBS is still on
-        # _protection_scene, so a manual scene change during an outage wins.
-        self._saved_scene = ""
-        self._protection_scene = ""
+        # Scene switching and restoring is done by the (shared) SceneArbiter
 
         # Source visibility restore tracking
         # Stores {state_name: (scene, source, original_visibility)} for undo
@@ -143,6 +149,13 @@ class BitrateEngine(QObject):
         self._outage_start = None if self._state == StreamState.NORMAL else now
         self._longest_outage = 0.0
 
+    @property
+    def stream_name(self) -> str:
+        return getattr(self.cfg, "name", "Main")
+
+    def _log(self, msg: str):
+        self.log_entry.emit(f"[{self.stream_name}] {msg}" if self.prefix_logs else msg)
+
     # --- Audio ---
 
     def _play_audio(self, file_path: str):
@@ -176,9 +189,9 @@ class BitrateEngine(QObject):
                     headers={"Content-Type": "application/json"},
                 )
                 if resp.status_code >= 400:
-                    self.log_entry.emit(f"Webhook HTTP {resp.status_code}")
+                    self._log(f"Webhook HTTP {resp.status_code}")
             except Exception as e:
-                self.log_entry.emit(f"Webhook error: {e}")
+                self._log(f"Webhook error: {e}")
 
         threading.Thread(target=_post, daemon=True).start()
 
@@ -200,7 +213,7 @@ class BitrateEngine(QObject):
             self._play_audio(self.cfg.get("notifications", audio_key))
         if webhook_enabled:
             msg = self.cfg.get("notifications", msg_key)
-            self._send_webhook(msg.replace("{bitrate}", bitrate_str))
+            self._send_webhook(msg.replace("{bitrate}", bitrate_str).replace("{stream}", self.stream_name))
 
     # --- Properties (thread-safe enough for tests and post-shutdown reads) ---
 
@@ -246,6 +259,15 @@ class BitrateEngine(QObject):
         self._history.clear()
         self._graph_history.clear()
 
+    @pyqtSlot()
+    def retire(self):
+        """The stream was removed in Settings: undo its OBS actions (release
+        its scene request, restore sources), log its summary, close its CSV."""
+        self._test_state = None
+        self._restore_all()
+        self.log_summary()
+        self.stop_logging()
+
     @pyqtSlot(str)
     def simulate(self, kind: str):
         """Rehearse the protection setup. kind: "low", "disconnect", or "" to end.
@@ -258,7 +280,7 @@ class BitrateEngine(QObject):
             target = StreamState.LOW_BITRATE if kind == "low" else StreamState.DISCONNECTED
             self._test_state = target
             self._test_until = now + TEST_MODE_MAX_S
-            self.log_entry.emit(
+            self._log(
                 f"TEST: simulating {target.name} (ends automatically after {TEST_MODE_MAX_S}s)"
             )
             if self._state != target:
@@ -271,7 +293,7 @@ class BitrateEngine(QObject):
         if self._test_state is None:
             return
         self._test_state = None
-        self.log_entry.emit(f"TEST: {how}, returning to normal")
+        self._log(f"TEST: {how}, returning to normal")
         if self._state != StreamState.NORMAL:
             self._transition_to(StreamState.NORMAL, now, self._last_avg, test=True)
         self._in_grace = False
@@ -348,6 +370,8 @@ class BitrateEngine(QObject):
             "uptime_s": now - self._session_start,
             "samples_in_window": len(self._history),
             "link": dict(self._link_summary),
+            "stream_id": self.stream_id,
+            "stream_name": self.stream_name,
             # Snapshot for the graph: the GUI must not iterate the live deque
             # from another thread.
             "graph": list(self._graph_history),
@@ -509,7 +533,7 @@ class BitrateEngine(QObject):
     def _log_once(self, msg: str):
         if msg != self._last_once_msg:
             self._last_once_msg = msg
-            self.log_entry.emit(msg)
+            self._log(msg)
 
 
     def _accumulate_time(self, now: float):
@@ -543,7 +567,7 @@ class BitrateEngine(QObject):
         reason = ""
         if not test and new_state == StreamState.LOW_BITRATE:
             reason = self._link_problem()
-        self.log_entry.emit(
+        self._log(
             f"{'TEST ' if test else ''}TRANSITION: {old_state.name} -> {new_state.name}, "
             f"scene='{self.obs.current_scene}', avg={avg_kbps:.0f} kbps"
             + (f", {reason}" if reason else "")
@@ -578,8 +602,28 @@ class BitrateEngine(QObject):
             self._apply_protection(now)
 
         self._fire_notifications(new_state, avg_kbps, test=test)
+        self._notify_obs(new_state, old_state, avg_kbps, test)
         self.state_changed.emit(new_state.name, old_state.name)
         return True
+
+    def _notify_obs(self, new_state: StreamState, old_state: StreamState, avg_kbps: float, test: bool):
+        """obs-websocket CustomEvent for other tools, and a recording chapter."""
+        if not self.obs.is_connected:
+            return
+        if self.cfg.get("integrations", "obs_custom_event"):
+            self.obs.broadcast_event({
+                "source": APP_INTERNAL_NAME,
+                "event": "state_changed",
+                "stream": self.stream_name,
+                "state": new_state.name,
+                "previous": old_state.name,
+                "test": bool(test),
+                "avg_kbps": round(avg_kbps),
+            })
+        if not test and self.cfg.get("integrations", "record_chapters"):
+            ok, why = self.obs.add_record_chapter(f"{self.stream_name}: {new_state.name}")
+            if not ok and why:
+                self._log_once(f"Recording chapter not added: {why}")
 
     # --- OBS actions ---
 
@@ -592,10 +636,13 @@ class BitrateEngine(QObject):
         scene. Throttled so a persistent failure doesn't hammer OBS."""
         if now - self._last_action_attempt < 3.0 or not self.obs.is_connected:
             return
+        if self.arbiter.pending:
+            self._last_action_attempt = now
+            self.arbiter.reconcile()
         if self._state != StreamState.NORMAL:
             if not self._action_applied:
                 self._apply_protection(now)
-        elif self._saved_scene or self._source_restore:
+        elif self.arbiter.holds(self.stream_id) or self._source_restore:
             self._last_action_attempt = now
             self._restore_all()
 
@@ -609,9 +656,9 @@ class BitrateEngine(QObject):
 
         current = self.obs.current_scene
         whitelist = self.cfg.get("scenes", "whitelist")
-        # Whitelist only blocks leaving the streamer's own scene. Once we have
-        # switched away (saved scene set), moving between protection scenes is fine.
-        if current in whitelist and not self._saved_scene:
+        # Whitelist only blocks leaving the streamer's own scene. Once the
+        # arbiter has switched away, moving between protection scenes is fine.
+        if current in whitelist and not self.arbiter.active:
             self._log_once(
                 f"Scene '{current}' is whitelisted: {key} action held until the scene changes"
             )
@@ -630,32 +677,40 @@ class BitrateEngine(QObject):
         if ok:
             self._last_once_msg = ""
 
+    def _scene_target(self, state_key: str) -> str:
+        """Target scene for this state, honouring per-scene targets: if the
+        streamer was on a scene listed in scene_overrides, use its target."""
+        origin = self.arbiter.original_scene if self.arbiter.active else self.obs.current_scene
+        short = "low" if state_key == "low_bitrate" else "disconnect"
+        for rule in self.cfg.get("scenes", "scene_overrides") or []:
+            if isinstance(rule, dict) and rule.get("when_on") == origin and rule.get(short):
+                return rule[short]
+        return self.cfg.get("scenes", f"{state_key}_scene")
+
     def _execute_scene_switch(self, state_key: str) -> bool:
-        """Switch to the configured scene for this state. True when done or
-        when there is nothing to do."""
-        target_scene = self.cfg.get("scenes", f"{state_key}_scene")
-        current_scene = self.obs.current_scene
+        """Ask the arbiter to show this state's scene. True when done or when
+        there is nothing to do."""
+        target_scene = self._scene_target(state_key)
         reason = "Low bitrate" if state_key == "low_bitrate" else "Disconnect"
 
         if not target_scene:
             self._log_once(f"SWITCH SKIPPED: no target scene configured for {state_key}")
             return True
 
-        if target_scene == current_scene:
-            if self._saved_scene:
-                self._protection_scene = target_scene
-            self.log_entry.emit(f"SWITCH SKIPPED: already on '{target_scene}'")
-            return True
-
-        if not self.obs.switch_scene(target_scene):
+        before = self.obs.current_scene
+        label = f"{self.stream_name}: {reason}" if self.prefix_logs else reason
+        if not self.arbiter.request(self.stream_id, target_scene, SEVERITY[state_key], label):
             self._log_once(f"SWITCH FAILED: could not switch to '{target_scene}' (will retry)")
             return False
 
-        if not self._saved_scene:
-            self._saved_scene = current_scene
-        self._protection_scene = target_scene
-        self.scene_switch_triggered.emit(target_scene, reason)
-        self.log_entry.emit(f"Scene -> '{target_scene}': {reason}")
+        now_on = self.obs.current_scene
+        if now_on == target_scene and before != target_scene:
+            self.scene_switch_triggered.emit(target_scene, reason)
+            self._log(f"Scene -> '{target_scene}': {reason}")
+        elif now_on == target_scene:
+            self._log(f"SWITCH SKIPPED: already on '{target_scene}'")
+        else:
+            self._log(f"Scene '{target_scene}' requested; '{now_on}' stays (a more severe stream outage)")
         return True
 
     def _execute_source_toggle(self, state_key: str) -> bool:
@@ -685,7 +740,7 @@ class BitrateEngine(QObject):
             return False
 
         self.source_toggle_triggered.emit(scene, source, target_vis, state_name)
-        self.log_entry.emit(f"Source toggle: {verb} '{source}' in '{scene}'")
+        self._log(f"Source toggle: {verb} '{source}' in '{scene}'")
         return True
 
     def _restore_all(self):
@@ -695,28 +750,10 @@ class BitrateEngine(QObject):
         self._restore_saved_scene()
 
     def _restore_saved_scene(self) -> bool:
-        """Switch back to the streamer's scene if we switched away. Returns
-        False only if a needed switch failed (kept for retry)."""
-        if not self._saved_scene:
-            return True
-        if not self.obs.is_connected:
-            return False
-
-        current = self.obs.current_scene
-        if current != self._protection_scene:
-            self.log_entry.emit(
-                f"Scene changed manually to '{current}' during protection; "
-                f"not switching back to '{self._saved_scene}'"
-            )
-        else:
-            if not self.obs.switch_scene(self._saved_scene):
-                return False
-            self.scene_switch_triggered.emit(self._saved_scene, "Bitrate recovered")
-            self.log_entry.emit(f"Scene restored -> '{self._saved_scene}'")
-
-        self._saved_scene = ""
-        self._protection_scene = ""
-        return True
+        """Withdraw this stream's scene request. The arbiter switches back
+        once no stream needs a protection scene. False only if a needed
+        switch failed (kept for retry)."""
+        return self.arbiter.release(self.stream_id)
 
     def _undo_source_toggle(self, state_name: str):
         """Restore a source to its original visibility for the given state.
@@ -727,7 +764,7 @@ class BitrateEngine(QObject):
         if original_vis is None or self.obs.set_source_visibility(scene, source, original_vis):
             del self._source_restore[state_name]
             if original_vis is not None:
-                self.log_entry.emit(
+                self._log(
                     f"Source restored: '{source}' in '{scene}' -> "
                     f"{'visible' if original_vis else 'hidden'}"
                 )
@@ -741,7 +778,8 @@ class BitrateEngine(QObject):
             log_dir = str(Path.home() / APP_INTERNAL_NAME / "logs")
         Path(log_dir).mkdir(parents=True, exist_ok=True)
 
-        filename = f"bitrate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.stream_name) or "stream"
+        filename = f"bitrate_{slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         filepath = os.path.join(log_dir, filename)
         self._log_file = open(filepath, "w", newline="", encoding="utf-8")
         self._csv_writer = csv.writer(self._log_file)
@@ -751,14 +789,14 @@ class BitrateEngine(QObject):
             "timestamp", "bitrate_kbps", "avg_kbps", "state",
             "event", "packet_loss_pct", "rtt_ms",
         ])
-        self.log_entry.emit(f"Logging started: {filepath}")
+        self._log(f"Logging started: {filepath}")
 
     def stop_logging(self):
         if self._log_file:
             self._log_file.close()
             self._log_file = None
             self._csv_writer = None
-            self.log_entry.emit("Logging stopped")
+            self._log("Logging stopped")
 
     def _write_log(self, ts: float, bitrate: float, avg: float, state: str):
         event, self._pending_event = self._pending_event, ""
@@ -776,7 +814,7 @@ class BitrateEngine(QObject):
         """Log the session summary and, if CSV logging is on, write it as a
         row too (the Log tab is gone once the app has quit)."""
         text = self.session_summary()
-        self.log_entry.emit(text)
+        self.log_entry.emit(text)  # already names the stream; no [prefix]
         if self._csv_writer:
             self._csv_writer.writerow([datetime.now().isoformat(), "", "", self._state.name, text, "", ""])
             self._log_file.flush()
@@ -792,7 +830,7 @@ class BitrateEngine(QObject):
         if self._outage_start is not None:
             longest = max(longest, now - self._outage_start)
         parts = [
-            f"SESSION SUMMARY: {format_duration(now - self._session_start)} monitored",
+            f"SESSION SUMMARY ({self.stream_name}): {format_duration(now - self._session_start)} monitored",
             f"{self._drop_count} drop{'s' if self._drop_count != 1 else ''}",
             f"low bitrate {format_duration(times[StreamState.LOW_BITRATE])}",
             f"disconnected {format_duration(times[StreamState.DISCONNECTED])}",

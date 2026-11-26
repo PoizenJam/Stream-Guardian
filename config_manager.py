@@ -2,6 +2,15 @@
 Configuration manager for Stream Guardian.
 Handles persistent settings, preset save/load, and defaults.
 
+Config format v2 (Stream Guardian 2.0): several monitored streams. Each entry
+in "streams" has its own ingest settings ("srs"), thresholds and protection
+actions (the per-stream keys of "scenes"); OBS, notifications, the scene
+whitelist, transitions and the UI stay global. StreamConfig gives one stream a
+get()/set() view with the same call style as ConfigManager, so the engine and
+ingest poller read their settings unchanged. A v1 config or preset (flat
+"srs"/"thresholds"/"scenes") is migrated to one stream named "Main".
+ConfigManager.get()/set() on a per-stream key resolve to the first stream.
+
 Saves are atomic (write temp file, fsync, os.replace) and the previous good
 file is kept as config.json.bak. A config that fails to parse is moved aside
 as config.corrupt-<timestamp>.json instead of being silently overwritten
@@ -12,15 +21,18 @@ import os
 import copy
 import shutil
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 # === App identity — change these to rename/version the app ===
 APP_NAME = "Stream Guardian"           # Display name (window title, tray, webhooks)
 APP_INTERNAL_NAME = "StreamGuardian"   # Folder/exe name (no spaces, used for paths)
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.0.0"
+CONFIG_VERSION = 2
 
-DEFAULT_CONFIG = {
+# Flat (v1-style) defaults; DEFAULT_CONFIG / DEFAULT_STREAM are derived below.
+_FLAT_DEFAULTS = {
     "srs": {
         "backend": "oryx",             # "oryx", "mediamtx", or "generic"
         "host": "localhost",
@@ -93,6 +105,10 @@ DEFAULT_CONFIG = {
         "disconnect_source_scene": "",
         "disconnect_source_name": "",
         "disconnect_source_action": "hide",
+        # Per-scene targets: [{"when_on": scene, "low": scene, "disconnect": scene}].
+        # When the streamer is on "when_on", these replace the stream's normal
+        # scene-mode targets (blank = use the normal one).
+        "scene_overrides": [],
     },
     "graph": {
         "history_seconds": 120,
@@ -128,7 +144,132 @@ DEFAULT_CONFIG = {
         # restart. Old configs with "enabled" are ignored by _merge.
         "hotkey": "Ctrl+Shift+F12",
     },
+    "startup": {
+        "start_with_windows": False,   # HKCU Run entry, starts minimized to tray
+        "check_updates": True,         # GitHub Releases check at launch (notice only)
+    },
+    "integrations": {
+        # obs-websocket CustomEvent on every state change, for Streamer.bot,
+        # Advanced Scene Switcher, browser sources, etc.
+        "obs_custom_event": True,
+        # Chapter marker in the OBS recording on real state changes
+        # (OBS 30.2+, Hybrid MP4 recordings only)
+        "record_chapters": False,
+    },
+    "overlay": {
+        "enabled": False,      # local web page for an OBS Browser Source
+        "port": 8765,
+        "allow_lan": False,    # False = 127.0.0.1 only
+    },
 }
+
+STREAM_SECTIONS = ("srs", "thresholds")
+STREAM_SCENE_KEYS = (
+    "low_bitrate_scene", "disconnect_scene",
+    "low_bitrate_mode", "low_bitrate_source_scene", "low_bitrate_source_name",
+    "low_bitrate_source_action",
+    "disconnect_mode", "disconnect_source_scene", "disconnect_source_name",
+    "disconnect_source_action",
+    "scene_overrides",
+)
+
+
+def is_stream_key(section: str, key: str = None) -> bool:
+    if section in STREAM_SECTIONS:
+        return True
+    return section == "scenes" and key in STREAM_SCENE_KEYS
+
+
+def _stream_from_flat(flat: dict, name: str = "Main", sid: str = "main") -> dict:
+    return {
+        "id": sid,
+        "name": name,
+        "srs": copy.deepcopy(flat.get("srs", {})),
+        "thresholds": copy.deepcopy(flat.get("thresholds", {})),
+        "scenes": {k: copy.deepcopy(v) for k, v in flat.get("scenes", {}).items()
+                   if k in STREAM_SCENE_KEYS},
+    }
+
+
+DEFAULT_STREAM = _stream_from_flat(_FLAT_DEFAULTS)
+DEFAULT_CONFIG = {k: copy.deepcopy(v) for k, v in _FLAT_DEFAULTS.items() if k not in STREAM_SECTIONS}
+DEFAULT_CONFIG["scenes"] = {k: v for k, v in DEFAULT_CONFIG["scenes"].items()
+                            if k not in STREAM_SCENE_KEYS}
+DEFAULT_CONFIG["config_version"] = CONFIG_VERSION
+DEFAULT_CONFIG["streams"] = [copy.deepcopy(DEFAULT_STREAM)]
+
+
+def migrate_config(data: dict) -> dict:
+    """Bring a loaded config or preset to the current format (in place)."""
+    if not isinstance(data, dict):
+        return data
+    if "streams" not in data:
+        # v1: flat srs/thresholds/scenes -> one stream named "Main"
+        stream = _stream_from_flat(data)
+        data.pop("srs", None)
+        data.pop("thresholds", None)
+        if isinstance(data.get("scenes"), dict):
+            for k in STREAM_SCENE_KEYS:
+                data["scenes"].pop(k, None)
+        data["streams"] = [stream]
+    data["config_version"] = CONFIG_VERSION
+    return data
+
+
+def new_stream_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+class StreamConfig:
+    """One stream's view of the configuration, with ConfigManager's call style.
+    Per-stream keys read and write that stream's entry; everything else goes
+    to the global config."""
+
+    def __init__(self, root: "ConfigManager", stream_id: str):
+        self.root = root
+        self.id = stream_id
+        self._last = None  # last seen settings, used after the stream is deleted
+
+    @property
+    def data(self) -> dict:
+        for s in self.root.config["streams"]:
+            if s.get("id") == self.id:
+                self._last = s
+                return s
+        # Deleted (an engine is retiring): keep using this stream's own last
+        # settings, never another stream's.
+        if self._last is not None:
+            return self._last
+        return self.root.config["streams"][0]
+
+    @property
+    def name(self) -> str:
+        return self.data.get("name", "Stream")
+
+    def get(self, *keys):
+        if len(keys) >= 2 and is_stream_key(keys[0], keys[1]):
+            val = self.data[keys[0]]
+            for k in keys[1:]:
+                val = val[k]
+            return val
+        return self.root.get(*keys)
+
+    def set(self, *keys_and_value):
+        keys, value = keys_and_value[:-1], keys_and_value[-1]
+        if len(keys) >= 2 and is_stream_key(keys[0], keys[1]):
+            d = self.data[keys[0]]
+            for k in keys[1:-1]:
+                d = d[k]
+            d[keys[-1]] = value
+            self.root.save()
+        else:
+            self.root.set(*keys_and_value)
+
+    def batch(self):
+        return self.root.batch()
+
+    def save(self) -> bool:
+        return self.root.save()
 
 
 class ConfigManager:
@@ -158,7 +299,22 @@ class ConfigManager:
             return
         saved = self._read_json(self.config_path)
         if saved is not None:
-            self._merge(self.config, saved)
+            was_v1 = "streams" not in saved
+            self._apply_loaded(saved)
+            if was_v1:
+                # Keep the 1.x file for a rollback; config.json.bak gets
+                # overwritten by the next save, this one doesn't.
+                keep = self.config_dir / "config.v1-backup.json"
+                try:
+                    if not keep.exists():
+                        shutil.copy2(self.config_path, keep)
+                except OSError:
+                    pass
+                self.load_message = (
+                    "settings upgraded to the Stream Guardian 2.0 format (one stream named \"Main\"); "
+                    "your 1.x settings are kept as config.v1-backup.json"
+                )
+                self.save()
             return
 
         # Unreadable: keep the bad file for inspection and fall back to the backup
@@ -170,10 +326,77 @@ class ConfigManager:
             pass
         backup = self._read_json(self.backup_path) if self.backup_path.exists() else None
         if backup is not None:
-            self._merge(self.config, backup)
+            self._apply_loaded(backup)
             self.load_message = f"config.json was unreadable; restored from backup (bad file kept as {corrupt.name})"
         else:
             self.load_message = f"config.json was unreadable and no backup exists; using defaults (bad file kept as {corrupt.name})"
+        self.save()
+
+    def _apply_loaded(self, data: dict):
+        """Merge a loaded (possibly v1) config onto fresh defaults."""
+        data = migrate_config(copy.deepcopy(data))
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
+        streams = data.pop("streams", None)
+        self._merge(self.config, data)
+        self.config["config_version"] = CONFIG_VERSION
+        self.config["streams"] = self._normalize_streams(streams)
+
+    @staticmethod
+    def _normalize_streams(streams) -> list:
+        """Each stream merged onto DEFAULT_STREAM; ids and names made unique."""
+        out, seen_ids, seen_names = [], set(), set()
+        for raw in streams if isinstance(streams, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            s = copy.deepcopy(DEFAULT_STREAM)
+            ConfigManager._merge(s, raw)
+            sid = str(raw.get("id") or "")
+            if not sid or sid in seen_ids:
+                sid = new_stream_id()
+            s["id"] = sid
+            name = str(raw.get("name") or "Stream").strip() or "Stream"
+            base, n = name, 2
+            while name in seen_names:
+                name, n = f"{base} {n}", n + 1
+            s["name"] = name
+            seen_ids.add(sid)
+            seen_names.add(name)
+            out.append(s)
+        return out or [copy.deepcopy(DEFAULT_STREAM)]
+
+    # --- Streams ---
+
+    def streams(self) -> list:
+        return self.config["streams"]
+
+    def stream_view(self, stream_id: str) -> StreamConfig:
+        return StreamConfig(self, stream_id)
+
+    def add_stream(self, name: str, copy_from: str = None) -> str:
+        """Add a stream (copying another's settings if given). Returns its id."""
+        src = None
+        if copy_from:
+            src = next((s for s in self.streams() if s["id"] == copy_from), None)
+        s = copy.deepcopy(src if src else DEFAULT_STREAM)
+        s["id"] = new_stream_id()
+        s["name"] = name
+        self.config["streams"].append(s)
+        self.config["streams"] = self._normalize_streams(self.config["streams"])
+        self.save()
+        return s["id"]
+
+    def remove_stream(self, stream_id: str) -> bool:
+        if len(self.streams()) <= 1:
+            return False
+        self.config["streams"] = [s for s in self.streams() if s["id"] != stream_id]
+        self.save()
+        return True
+
+    def rename_stream(self, stream_id: str, name: str):
+        for s in self.streams():
+            if s["id"] == stream_id:
+                s["name"] = name
+        self.config["streams"] = self._normalize_streams(self.config["streams"])
         self.save()
 
     @staticmethod
@@ -243,6 +466,8 @@ class ConfigManager:
                 self.save()
 
     def get(self, *keys):
+        if len(keys) >= 2 and is_stream_key(keys[0], keys[1]):
+            return StreamConfig(self, self.streams()[0]["id"]).get(*keys)
         val = self.config
         for k in keys:
             val = val[k]
@@ -251,6 +476,9 @@ class ConfigManager:
     def set(self, *keys_and_value):
         keys = keys_and_value[:-1]
         value = keys_and_value[-1]
+        if len(keys) >= 2 and is_stream_key(keys[0], keys[1]):
+            StreamConfig(self, self.streams()[0]["id"]).set(*keys_and_value)
+            return
         d = self.config
         for k in keys[:-1]:
             d = d[k]
@@ -277,8 +505,7 @@ class ConfigManager:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 preset = json.load(f)
-            self.config = copy.deepcopy(DEFAULT_CONFIG)
-            self._merge(self.config, preset)
+            self._apply_loaded(preset)  # migrates v1 presets too
             self.save()
             return True
         except (json.JSONDecodeError, IOError):
