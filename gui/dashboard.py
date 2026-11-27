@@ -7,6 +7,7 @@ import pyqtgraph as pg
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QGroupBox, QPushButton, QFrame, QSizePolicy, QSpinBox, QComboBox,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -65,9 +66,13 @@ class StatCard(QFrame):
             }
         """)
 
+        # Fixed height: in a short window the panel scrolls instead of
+        # squashing cards and Session Stats until their text overlaps.
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(0)
 
         self._title = QLabel(title)
         self._title.setProperty("dim", True)
@@ -75,7 +80,7 @@ class StatCard(QFrame):
 
         self._value = QLabel("—")
         font = QFont()
-        font.setPointSize(20)
+        font.setPointSize(16)
         font.setWeight(QFont.Weight.Bold)
         self._value.setFont(font)
         self._value.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -84,8 +89,9 @@ class StatCard(QFrame):
         self._unit.setProperty("dim", True)
 
         val_row = QHBoxLayout()
-        val_row.addWidget(self._value)
-        val_row.addWidget(self._unit)
+        val_row.setSpacing(5)
+        val_row.addWidget(self._value, alignment=Qt.AlignmentFlag.AlignBaseline)
+        val_row.addWidget(self._unit, alignment=Qt.AlignmentFlag.AlignBaseline)
         val_row.addStretch()
 
         layout.addWidget(self._title)
@@ -243,7 +249,7 @@ class DashboardTab(QWidget):
             "the stream arrives over SRT; shows n/a otherwise."
         )
         link_font = self.card_link._value.font()
-        link_font.setPointSize(14)
+        link_font.setPointSize(13)
         self.card_link._value.setFont(link_font)
 
         stats_panel.addWidget(self.card_current)
@@ -254,8 +260,11 @@ class DashboardTab(QWidget):
 
         # Session stats group
         session_group = QGroupBox("Session Stats")
+        session_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         session_layout = QGridLayout()
-        session_layout.setSpacing(4)
+        session_layout.setHorizontalSpacing(10)
+        session_layout.setVerticalSpacing(3)
+        session_layout.setColumnStretch(1, 1)
 
         self.lbl_peak = QLabel("—")
         self.lbl_min = QLabel("—")
@@ -273,6 +282,7 @@ class DashboardTab(QWidget):
         for i, (name, widget) in enumerate(labels):
             lbl = QLabel(name)
             lbl.setProperty("dim", True)
+            widget.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             session_layout.addWidget(lbl, i, 0)
             session_layout.addWidget(widget, i, 1)
 
@@ -280,11 +290,20 @@ class DashboardTab(QWidget):
         stats_panel.addWidget(session_group)
         stats_panel.addStretch()
 
+        stats_panel.setContentsMargins(0, 0, 4, 0)
         stats_widget = QWidget()
         stats_widget.setLayout(stats_panel)
-        stats_widget.setMinimumWidth(180)
-        stats_widget.setMaximumWidth(240)
-        content.addWidget(stats_widget)
+
+        # Scrolls vertically only when the window is too short for the column
+        stats_scroll = QScrollArea()
+        stats_scroll.setWidget(stats_widget)
+        stats_scroll.setWidgetResizable(True)
+        stats_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        stats_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        stats_scroll.setMinimumWidth(200)
+        stats_scroll.setMaximumWidth(250)
+        stats_scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        content.addWidget(stats_scroll)
 
         layout.addLayout(content, stretch=1)
 
@@ -298,6 +317,14 @@ class DashboardTab(QWidget):
         plot_widget.showGrid(x=True, y=True, alpha=0.15)
         plot_widget.setLabel("left", "Bitrate", units="kbps")
         plot_widget.setLabel("bottom", "Time", units="s")
+        # The values are already kbps: without this, pyqtgraph rescales and
+        # labels the axis "kkbps" (1.2 meaning 1200 kbps).
+        plot_widget.getAxis("left").enableAutoSIPrefix(False)
+        plot_widget.getAxis("bottom").enableAutoSIPrefix(False)
+
+        # Legend must exist before the curves are added, or it stays empty
+        legend = plot_widget.addLegend(offset=(10, 10))
+        legend.setBrush(pg.mkBrush(c["bg_panel"] + "cc"))
         plot_widget.setMouseEnabled(x=False, y=True)
         # Lock Y minimum at 0, auto-range upper only
         plot_widget.enableAutoRange(axis="y", enable=False)
@@ -333,10 +360,6 @@ class DashboardTab(QWidget):
         )
         plot_widget.addItem(self.line_low)
         plot_widget.addItem(self.line_disc)
-
-        # Legend
-        legend = plot_widget.addLegend(offset=(10, 10))
-        legend.setBrush(pg.mkBrush(c["bg_panel"] + "cc"))
 
         self._plot_widget = plot_widget
         self.refresh_graph_options()
